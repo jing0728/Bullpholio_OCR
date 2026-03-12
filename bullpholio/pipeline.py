@@ -144,9 +144,16 @@ def run_pipeline(
                         f"suspicious={detail.suspicious_rows})")
 
             # Derive parse_status from record count + detail
+            # Rules:
+            #   0 records              → failed
+            #   any skipped rows       → partial_success (data was lost)
+            #   suspicious rows > 30%  → partial_success (most values untrustworthy)
+            #   suspicious rows ≤ 30%  → success with notes (isolated outliers are OK)
+            total_rows = max(len(records) + detail.skipped_rows, 1)
+            suspicious_ratio = detail.suspicious_rows / total_rows
             if len(records) == 0:
                 parse_status = "failed"
-            elif detail.skipped_rows > 0 or detail.suspicious_rows > 0:
+            elif detail.skipped_rows > 0 or suspicious_ratio > 0.30:
                 parse_status = "partial_success"
             else:
                 parse_status = "success"
@@ -189,10 +196,17 @@ def run_pipeline(
     total_ms = elapsed_ms(pipeline_start)
     logger.info(f"[4] Done — {len(all_records)} record(s) total ({total_ms} ms)")
 
+    # Top-level status stays "success" | "partial" | "failed":
+    #   failed  → no records at all
+    #   partial → records extracted but parse_errors OR any table is partial_success
+    #   success → all tables clean
+    has_partial_table = any(
+        s.parse_status == "partial_success" for s in all_summaries
+    )
     status = (
-        "success" if all_records and not parse_errors else
-        "partial" if all_records else
-        "failed"
+        "failed"  if not all_records else
+        "partial" if parse_errors or has_partial_table else
+        "success"
     )
 
     return PipelineResult(
