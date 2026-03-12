@@ -1,28 +1,31 @@
 """
 extractors/image_extractor.py
 ------------------------------
-Detects table structure in images using OpenCV, then dispatches to OCR.
+Image validation, table detection, and OCR dispatch.
 
-Error routing logic (unified for all image formats):
+Unified rejection path — ALL image formats (jpg/png/bmp/gif/webp/tiff) go
+through the same gate in this exact order:
 
-  GATE 1 — Resolution hard-minimum (before any heavy processing):
-    If image is too small to be readable → reject with resolution error.
-    This prevents spending 25s on a guaranteed-failure.
+  1. FAST QUALITY GATE  (~5-50ms, OpenCV only, no EasyOCR)
+     a. Dimension check  — width OR height below hard floor → fast fail
+     b. Text density     — estimate text pixel coverage; too sparse → fast fail
+     c. Table structure  — morphological line/contour detection → no table → fail
 
-  GATE 2 — Table structure check:
-    If image has no table → image_no_table(), regardless of OCR mode.
-    This gives the correct message to flower.jpg, cat.gif, etc.
-    A cat photo is rejected because "no table", NOT because "OCR disabled".
+  2. OCR MODE CHECK  (only reached if table was detected)
+     → allow_ocr=False → image_ocr_disabled()
 
-  GATE 3 — OCR mode check (only reached if table IS present):
-    If table detected but allow_ocr=False → image_ocr_disabled().
-    This message only appears when OCR would actually help.
+  3. OCR  (only reached for table images with OCR enabled and good quality)
 
-This order ensures all image formats (.jpg, .bmp, .png, .gif) get
-consistent, accurate rejection messages.
+This order guarantees:
+  - cat.gif / flower.jpg / flower.bmp  → rejected at step 1c ("no table"),
+    regardless of allow_ocr setting
+  - trans.png (330×180px)              → rejected at step 1a ("resolution too low"),
+    no OCR attempted at all  →  ~50ms instead of ~40s
+  - stock.png / SPDR.png               → pass all gates, run OCR
 """
 
 import cv2
+import numpy as np
 import pandas as pd
 
 from bullpholio.core.errors import (
@@ -33,21 +36,56 @@ from bullpholio.core.errors import (
 )
 from bullpholio.extractors.normaliser import _normalise_dataframe
 
-# Minimum dimensions for OCR to be worth attempting.
-# EasyOCR's CRAFT detector needs ~20px character height.
-# A 400×250px image after 3× upscale gives ~750px, giving ~15px char height —
-# marginally workable. Below this, readtext burns 18s and returns nothing.
-_MIN_OCR_WIDTH  = 400
-_MIN_OCR_HEIGHT = 250
 
+# ── Thresholds ────────────────────────────────────────────────────────────────
+
+# Hard floor: width below this means EasyOCR cannot recover useful text even
+# after aggressive upscaling.  Testing shows 330px-wide images (trans.png)
+# produce 0 tokens regardless of preprocessing; 400px+ images work well.
+# Using width (not short side) because tables are always wider than tall.
+_MIN_WIDTH_FOR_OCR = 400   # pixels — fast fail if image width < this
+
+# Soft floor warning (non-fatal, just a note in warnings)
+_SOFT_MIN_WIDTH = 600      # pixels
+
+# Text density: fraction of pixels classified as dark after adaptive threshold.
+# Pure photos/logos score < 0.005; financial table screenshots score > 0.02.
+_MIN_TEXT_DENSITY = 0.01   # 1% — very permissive; catches blank/photo images
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_image_dimensions(image_path: str) -> tuple[int, int]:
-    """Return (width, height) of an image, or (0, 0) on failure."""
+    """Return (width, height), or (0, 0) on failure (e.g. animated GIF)."""
     img = cv2.imread(image_path)
     if img is None:
         return 0, 0
     h, w = img.shape[:2]
     return w, h
+
+
+def _estimate_text_density(image_path: str) -> float:
+    """
+    Quick text-presence estimate via adaptive threshold.
+    Returns fraction of pixels classified as 'dark' (text/line) in [0, 1].
+    Pure photos/logos typically score < 0.005; table screenshots score > 0.02.
+    Takes ~5-10ms on a typical image.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return 0.0
+    # Resize to max 400px wide for speed
+    h, w = img.shape[:2]
+    if w > 400:
+        scale = 400 / w
+        img = cv2.resize(img, (400, int(h * scale)), interpolation=cv2.INTER_AREA)
+    binary = cv2.adaptiveThreshold(
+        img, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blockSize=11, C=4,
+    )
+    return float(binary.sum() // 255) / binary.size
 
 
 def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
@@ -56,9 +94,7 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
 
     Stage 1 — grid lines: morphological line detection + connectedComponents.
     Stage 2 — borderless text-alignment fallback: contour-based column/row
-               bucket detection (pure OpenCV, no tesseract required).
-
-    Returns False if cv2 cannot read the image (e.g. corrupt/unsupported GIF frames).
+               bucket detection (pure OpenCV, no OCR required).
     """
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -70,7 +106,6 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
     # Stage 1: grid line detection
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(img_w // 10, 20), 1))
     h_lines  = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
-
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(img_h // 10, 20)))
     v_lines  = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
 
@@ -85,14 +120,13 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
         cv2.MORPH_RECT,
         (max(img_w // 40, 8), max(img_h // 80, 4)),
     )
-    dilated  = cv2.dilate(binary, cell_kernel, iterations=2)
+    dilated = cv2.dilate(binary, cell_kernel, iterations=2)
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     min_area   = (img_w * img_h) * 0.0001
     max_area   = (img_w * img_h) * 0.10
     max_blob_h = img_h * 0.15
     max_blob_w = img_w * 0.90
-    MIN_ASPECT = 2.0
 
     total_contours = len(contours)
     cx_list: list[int] = []
@@ -106,7 +140,7 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
             continue
         if bh > max_blob_h or bw > max_blob_w:
             continue
-        if (bw / bh) < MIN_ASPECT:
+        if (bw / bh) < 2.0:
             continue
         cx_list.append(x + bw // 2)
         cy_list.append(y + bh // 2)
@@ -125,20 +159,20 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
         return False
 
     total_x_buckets = max(1, img_w // x_bucket)
-    x_fill_ratio    = col_buckets / total_x_buckets
-    if col_buckets > 8 and x_fill_ratio > 0.55:
+    if col_buckets > 8 and (col_buckets / total_x_buckets) > 0.55:
         return False
 
     col_bucket_counts: dict[int, int] = {}
     for cx in cx_list:
         b = cx // x_bucket
         col_bucket_counts[b] = col_bucket_counts.get(b, 0) + 1
-    multi_row_cols = sum(1 for cnt in col_bucket_counts.values() if cnt >= 2)
-    if multi_row_cols < 2:
+    if sum(1 for c in col_bucket_counts.values() if c >= 2) < 2:
         return False
 
     return True
 
+
+# ── Main extractor ────────────────────────────────────────────────────────────
 
 def _extract_tables_from_image(
     file_path: str,
@@ -148,47 +182,58 @@ def _extract_tables_from_image(
     """
     Extract tables from an image file.
 
-    Gate order (same for ALL image formats — jpg, bmp, png, gif):
+    Gate order (all fast OpenCV — total overhead < 100ms):
+      1a. Min short-side check  → fast fail if too small for OCR
+      1b. Text density check    → fast fail if image is a photo/logo
+      1c. Table structure check → fast fail if no table layout detected
+      2.  OCR mode check        → fail if table found but allow_ocr=False
+      3.  OCR extraction
 
-      1. Resolution check  → image_resolution_too_low (fast fail, <0.1s)
-      2. Table check       → image_no_table           (catches photos, GIFs, charts)
-      3. OCR mode check    → image_ocr_disabled        (only shown when table IS present)
-      4. OCR extraction    → image_ocr_no_results      (shown after actual attempt)
-
-    Gate 2 runs BEFORE Gate 3 so that a flower photo or cat GIF always gets
-    "no table" — never "OCR disabled" — regardless of OCR mode setting.
+    For non-table images (photos/logos/gifs), the error is ALWAYS
+    image_no_table() — never image_ocr_disabled() — regardless of allow_ocr.
+    This prevents confusing messages like "enable OCR" on a flower photo.
     """
     if warnings is None:
         warnings = []
 
-    # ── GATE 1: resolution hard minimum ──────────────────────────────────────
-    # Do this before any heavy processing. OCR cannot read images below this
-    # threshold even after upscaling (CRAFT needs ~20px character height).
-    # This prevents burning 25s on a guaranteed failure like trans.png.
     w, h = _get_image_dimensions(file_path)
-    is_too_small = (w > 0 and h > 0 and w < _MIN_OCR_WIDTH and h < _MIN_OCR_HEIGHT)
-    if is_too_small:
-        # Even if allow_ocr=True, OCR would fail anyway — reject with resolution error.
-        raise ValueError(image_resolution_too_low(w, h, file_path))
+    short_side = min(w, h) if (w > 0 and h > 0) else 0
 
-    # Non-fatal warning for borderline images (small in one dimension only)
-    if w > 0 and (w < _MIN_OCR_WIDTH or h < _MIN_OCR_HEIGHT):
+    # ── Gate 1a: hard minimum width ──────────────────────────────────────────
+    # Images narrower than 400px cannot be read by EasyOCR even after 4×
+    # upscaling — CRAFT text detector produces 0 tokens at that resolution.
+    # This saves ~40s for trans.png (330×180) by skipping all OCR entirely.
+    # Also catches animated GIFs / corrupt files where cv2 returns (0, 0).
+    if w < _MIN_WIDTH_FOR_OCR:
+        if allow_ocr:
+            raise ValueError(image_resolution_too_low(w, h, file_path))
+        else:
+            raise ValueError(image_no_table(file_path))
+
+    # Soft warning for borderline images (pass but warn)
+    if w < _SOFT_MIN_WIDTH:
         warnings.append(image_resolution_too_low(w, h, file_path))
 
-    # ── GATE 2: table structure check (BEFORE OCR mode check) ────────────────
-    # A non-table image (photo, logo, animation) gets image_no_table()
-    # regardless of whether OCR is enabled.
-    # This is the correct message: the issue is "no table", not "no OCR".
+    # ── Gate 1b: text density pre-check ──────────────────────────────────────
+    # Pure photos, logos, and blank images have very few dark pixels after
+    # adaptive threshold.  Reject before the heavier table structure check.
+    density = _estimate_text_density(file_path)
+    if density < _MIN_TEXT_DENSITY:
+        raise ValueError(image_no_table(file_path))
+
+    # ── Gate 1c: table structure ──────────────────────────────────────────────
+    # Full morphological table detection.  A non-table image always gets
+    # image_no_table(), regardless of allow_ocr — the absence of a table is the
+    # real reason, not the OCR setting.
     if not _has_table_structure(file_path):
         raise ValueError(image_no_table(file_path))
 
-    # ── GATE 3: OCR mode check ────────────────────────────────────────────────
-    # Only reached when a real table structure was detected.
-    # Now it makes sense to tell the user "enable OCR to read this table".
+    # ── Gate 2: OCR mode check ────────────────────────────────────────────────
+    # Table exists — now check if we're allowed to read it.
     if not allow_ocr:
         raise ValueError(image_ocr_disabled())
 
-    # ── GATE 4: OCR extraction ────────────────────────────────────────────────
+    # ── Gate 3: OCR ──────────────────────────────────────────────────────────
     from bullpholio.extractors.ocr_extractor import _ocr_to_dataframe
 
     df = _ocr_to_dataframe(file_path)
