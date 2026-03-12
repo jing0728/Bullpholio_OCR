@@ -44,6 +44,8 @@ from bullpholio.extractors.normaliser import _normalise_dataframe
 # produce 0 tokens regardless of preprocessing; 400px+ images work well.
 # Using width (not short side) because tables are always wider than tall.
 _MIN_WIDTH_FOR_OCR = 400   # pixels — fast fail if image width < this
+_MIN_OCR_WIDTH     = _MIN_WIDTH_FOR_OCR   # alias used by ocr_extractor
+_MIN_OCR_HEIGHT    = 100                  # alias used by ocr_extractor (height floor)
 
 # Soft floor warning (non-fatal, just a note in warnings)
 _SOFT_MIN_WIDTH = 600      # pixels

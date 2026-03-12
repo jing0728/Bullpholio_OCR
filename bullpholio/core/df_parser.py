@@ -70,8 +70,8 @@ def _sanity_check_broker_holding(dto: BrokerHoldingDTO, idx) -> tuple[bool, str]
     """
     issues: list[str] = []
 
-    if dto.shares <= 0 or dto.shares > _SHARES_MAX:
-        issues.append(f"shares={dto.shares:.4g} out of expected range (0, 1B)")
+    if dto.shares < 0 or dto.shares > _SHARES_MAX:
+        issues.append(f"shares={dto.shares:.4g} out of expected range [0, 1B)")
 
     if dto.avg_cost_per_share > 0:
         if dto.avg_cost_per_share > _AVG_COST_MAX:
