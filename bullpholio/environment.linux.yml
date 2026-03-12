@@ -1,0 +1,71 @@
+# =========================
+# environment.linux.yml
+# =========================
+name: bullpholio-ocr
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip>=24.0
+
+  # core data stack
+  - numpy>=1.26
+  - pandas>=2.1
+  - openpyxl>=3.1
+
+  # image / OCR support
+  - pillow>=10
+  - scikit-image>=0.22
+  - matplotlib>=3.8
+
+  # system OCR dependency
+  - tesseract
+
+  - pip:
+      - pymupdf>=1.24
+      - pdfplumber>=0.11
+      - python-docx>=1.1
+      - easyocr>=1.7
+      - opencv-python-headless>=4.9
+      - pydantic>=2.6
+      - python-dotenv>=1.0
+
+
+
+# =========================
+# environment.windows.yml
+# =========================
+name: bullpholio-ocr
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip>=24.0
+
+  # core data stack
+  - numpy>=1.26
+  - pandas>=2.1
+  - openpyxl>=3.1
+
+  # image / OCR support
+  - pillow>=10
+  - scikit-image>=0.22
+  - matplotlib>=3.8
+
+  # Windows build dependencies
+  - vs2015_runtime
+
+  - pip:
+      - pymupdf>=1.24
+      - pdfplumber>=0.11
+      - python-docx>=1.1
+      - easyocr>=1.7
+      - opencv-python-headless>=4.9
+      - pydantic>=2.6
+      - python-dotenv>=1.0

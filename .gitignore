@@ -1,0 +1,31 @@
+# virtual environments
+.venv/
+.venv311/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# build / test / temp
+dist/
+build/
+*.log
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# env files
+.env
+
+# Jupyter
+.ipynb_checkpoints/
