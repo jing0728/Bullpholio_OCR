@@ -12,6 +12,17 @@ Parse path decision:
 
 Each parser also returns a ParseDetail object carrying confidence metadata
 (suspicious_rows, notes) so the pipeline can populate TableParseSummary.
+
+Warning hygiene
+───────────────
+Only user-actionable messages go into the `warnings` list (which flows into
+PipelineResult.warnings and is shown in the frontend):
+  • MissingRequiredColumns — tells the user what's missing
+  • rows_skipped           — tells the user how many rows were dropped and why
+  • sanity notes           — flags numeric values that look like OCR misreads
+
+Internal routing decisions (which type_hint was used, detect_input_type score)
+are written to logger.debug only and never appear in `warnings`.
 """
 
 import logging
@@ -47,10 +58,10 @@ from bullpholio.models.dtos import (
 
 # ── Sanity check thresholds ───────────────────────────────────────────────────
 
-_SHARES_MAX          = 1_000_000_000   # >1B shares in a personal portfolio = suspect
-_AVG_COST_MAX        = 1_000_000       # >$1M per share = suspect (Berkshire A ~$700k)
-_AVG_COST_MIN        = 0.0001          # <$0.0001 = likely OCR garbage
-_TOTAL_COST_TOLERANCE = 0.15           # 15% tolerance on shares × avg_cost ≈ total_cost
+_SHARES_MAX           = 1_000_000_000   # >1B shares in a personal portfolio = suspect
+_AVG_COST_MAX         = 1_000_000       # >$1M per share = suspect (Berkshire A ~$700k)
+_AVG_COST_MIN         = 0.0001          # <$0.0001 = likely OCR garbage
+_TOTAL_COST_TOLERANCE = 0.15            # 15% tolerance on shares × avg_cost ≈ total_cost
 
 
 def _sanity_check_broker_holding(dto: BrokerHoldingDTO, idx) -> tuple[bool, str]:
@@ -61,12 +72,9 @@ def _sanity_check_broker_holding(dto: BrokerHoldingDTO, idx) -> tuple[bool, str]
     Empty note means the row passed all checks.
 
     Checks (in order of severity):
-      1. shares in reasonable range (0 < shares < 1B)
+      1. shares in reasonable range (0 ≤ shares < 1B)
       2. avg_cost: cross-check with total_cost if available (±15%)
       3. avg_cost standalone: flag if it looks like an OCR digit-drop/shift
-         (e.g. 1033.19 vs 33.19 — value > $1000 for a fund/ETF is suspicious)
-         Heuristic: if avg_cost > 500 AND symbol looks like a fund (>4 chars
-         or ends in X), flag as possibly misread.
     """
     issues: list[str] = []
 
@@ -79,7 +87,6 @@ def _sanity_check_broker_holding(dto: BrokerHoldingDTO, idx) -> tuple[bool, str]
         elif dto.avg_cost_per_share < _AVG_COST_MIN:
             issues.append(f"avg_cost={dto.avg_cost_per_share} < {_AVG_COST_MIN} — possible OCR garbage")
 
-        # Cross-check with total_cost when available
         if dto.total_cost > 0 and dto.shares > 0:
             expected = dto.shares * dto.avg_cost_per_share
             ratio    = abs(dto.total_cost - expected) / max(expected, 1)
@@ -90,20 +97,12 @@ def _sanity_check_broker_holding(dto: BrokerHoldingDTO, idx) -> tuple[bool, str]
                     f"={expected:.2f}, diff {ratio*100:.0f}%)"
                 )
         else:
-            # No total_cost to cross-check — apply standalone heuristics.
-            # Flag if avg_cost is suspiciously high for a likely fund/ETF symbol.
-            # Fund/ETF tickers: >4 chars, or ends in X (GTLOX, VTIAX, etc.)
-            # These are rarely priced > $200/share; prices like 1033.19 likely
-            # indicate OCR merged a leading digit from an adjacent column.
             is_fund_like = (len(dto.symbol) > 4 or dto.symbol.endswith("X"))
             if is_fund_like and dto.avg_cost_per_share > 200:
                 issues.append(
                     f"avg_cost={dto.avg_cost_per_share:.2f} seems high for "
-                    f"fund-like symbol '{dto.symbol}' — possible OCR misread "
-                    f"(e.g. leading digit from adjacent column)"
+                    f"fund-like symbol '{dto.symbol}' — possible OCR misread"
                 )
-            # Also flag any ticker where avg_cost has an implausible leading digit:
-            # cost > 1000 but shares < 10 is unusual outside of Berkshire/NVR
             elif dto.avg_cost_per_share > 1000 and dto.shares < 100:
                 issues.append(
                     f"avg_cost={dto.avg_cost_per_share:.2f} with only "
@@ -137,11 +136,6 @@ class ParseDetail:
             return "medium"
         return "low"
 
-    @property
-    def parse_status(self, record_count: int = 0) -> str:
-        # Called externally with record_count; return value used by pipeline
-        return "high"  # placeholder — pipeline sets this based on record_count
-
 
 # ── BrokerHoldingDTO parser ───────────────────────────────────────────────────
 
@@ -170,7 +164,6 @@ def _df_to_broker_holdings(
                 detail.skipped_rows += 1
                 continue
 
-            # Sanity check — flag but don't skip
             suspicious, note = _sanity_check_broker_holding(dto, idx)
             if suspicious:
                 detail.suspicious_rows += 1
@@ -187,9 +180,8 @@ def _df_to_broker_holdings(
         msg = rows_skipped(len(errors), "holding")
         logger.warning(msg)
         for err in errors[:5]:
-            logger.warning(f"  {err}")
+            logger.debug(f"  {err}")
         warnings.append(msg)
-        warnings.extend(errors[:5])
 
     return records, detail
 
@@ -232,9 +224,8 @@ def _df_to_constituent_holdings(
         msg = rows_skipped(len(errors), "constituent holding")
         logger.warning(msg)
         for err in errors[:5]:
-            logger.warning(f"  {err}")
+            logger.debug(f"  {err}")
         warnings.append(msg)
-        warnings.extend(errors[:5])
 
     return records, detail
 
@@ -287,9 +278,8 @@ def _df_to_transactions(
         msg = rows_skipped(len(errors), "transaction")
         logger.warning(msg)
         for err in errors[:5]:
-            logger.warning(f"  {err}")
+            logger.debug(f"  {err}")
         warnings.append(msg)
-        warnings.extend(errors[:5])
 
     return records, detail
 
@@ -316,26 +306,24 @@ def parse_dataframe(
     columns = list(df.columns)
 
     # ── Type detection ────────────────────────────────────────────
-    # Use classifier hint if trustworthy; fall back to heuristic scorer.
+    # Routing decisions are internal — written to logger.debug only,
+    # never appended to `warnings` (which is user-facing).
     if type_hint in ("holding", "transaction", "constituent_holding"):
         input_type = type_hint
-        logger.debug(f"Using classifier type_hint={input_type} (skipping detect_input_type)")
-        warnings.append(f"input_type={input_type} (from classifier)")
+        logger.debug(f"Using classifier type_hint={input_type}")
     else:
-        input_type, confidence = detect_input_type(columns)
-        logger.debug(f"Detected input_type={input_type} ({confidence})")
-        warnings.append(f"input_type={input_type} ({confidence})")
+        input_type, confidence_note = detect_input_type(columns)
+        logger.debug(f"Detected input_type={input_type} ({confidence_note})")
 
     # ── Transaction path ──────────────────────────────────────────
     if input_type == "transaction":
         col_map = map_columns(columns, TRANSACTION_COLUMN_ALIASES)
         missing = [f for f in TRANSACTION_REQUIRED if col_map.get(f) is None]
         if missing:
-            # Hint might be wrong — retry with heuristic
             if type_hint == "transaction":
                 input_type, _ = detect_input_type(columns)
                 if input_type != "transaction":
-                    return parse_dataframe(df, logger, warnings)  # re-route without hint
+                    return parse_dataframe(df, logger, warnings)
             msg = missing_required_columns("transaction", missing, columns)
             logger.warning(msg)
             warnings.append(f"[MissingRequiredColumns] {msg}")
@@ -356,7 +344,6 @@ def parse_dataframe(
             _log_extra(columns, c_col_map, logger)
             records, detail = _df_to_constituent_holdings(df, c_col_map, logger, warnings)
             return "constituent_holding", records, detail
-        # Fall through to standard holding path
 
     # ── Holding path ──────────────────────────────────────────────
     h_col_map = map_columns(columns, HOLDING_COLUMN_ALIASES)
@@ -388,7 +375,6 @@ def parse_dataframe(
         records, detail = _df_to_constituent_holdings(df, c_col_map, logger, warnings)
         return "constituent_holding", records, detail
 
-    # Neither path worked
     msg = missing_required_columns("holding", h_missing, columns)
     logger.warning(msg)
     warnings.append(f"[MissingRequiredColumns] {msg}")
