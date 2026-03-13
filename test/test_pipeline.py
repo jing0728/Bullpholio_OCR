@@ -66,7 +66,8 @@ sys.path.insert(0, str(_here))         # test/ itself
 from bullpholio.pipeline import run_pipeline
 from bullpholio.models.dtos import HoldingDTO, TransactionDTO
 from bullpholio.models.results import PipelineResult
-
+from bullpholio.extractors.ocr_extractor import warmup_ocr
+warmup_ocr()
 # ── Colour helpers ────────────────────────────────────────────────
 GREEN  = "\033[92m"
 RED    = "\033[91m"
