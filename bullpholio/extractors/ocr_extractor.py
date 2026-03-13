@@ -258,10 +258,17 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
       • Image unreadable by OpenCV → empty DataFrame immediately
       • Both dimensions below OCR minimum → empty DataFrame immediately
 
-    Multi-strategy pipeline (only reached for viable images):
-      1. Strategy 1: tiered upscale + CLAHE + unsharp mask
-      2. Strategy 2: adaptive threshold (only if S1 yields 1–4 tokens)
-      Best result used for table reconstruction via Y/X clustering.
+    Table reconstruction — two-pass header-first approach:
+      Phase 1  Y-cluster all OCR tokens into row groups.
+      Phase 2  Score each row group against known column aliases to locate
+               the header row (no column assignment needed yet).
+      Phase 3  Use only the header row's X positions to define column
+               centres.  This avoids false clusters created by dense
+               numeric data (commas, decimal points, multi-digit numbers).
+      Phase 4  Compute column boundaries as midpoints between adjacent
+               centres.  Assign every token via boundaries rather than
+               pure nearest-centre to prevent cross-column absorption.
+      Phase 5  Build the 2-D grid and return as a DataFrame.
     """
     # ── Pre-OCR resolution gate ───────────────────────────────────────────────
     img_check = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -328,7 +335,7 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
     if not best_results:
         return pd.DataFrame()
 
-    # ── Reconstruct table from best results ──────────────────────
+    # ── Phase 1: Y-cluster tokens into row groups ─────────────────
     img   = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     img_h = img.shape[0] if img is not None else 500
     img_w = img.shape[1] if img is not None else 500
@@ -337,7 +344,6 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
 
     rows_raw: list[tuple[float, float, str]] = []
     for bbox, text, conf in best_results:
-        # bbox: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
         y_center = (bbox[0][1] + bbox[2][1]) / 2
         x_center = (bbox[0][0] + bbox[2][0]) / 2
         rows_raw.append((y_center, x_center, text))
@@ -345,7 +351,6 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
     if not rows_raw:
         return pd.DataFrame()
 
-    # Cluster by Y (rows)
     rows_raw.sort(key=lambda r: r[0])
     grouped: list[list[tuple[float, float, str]]] = []
     current_group = [rows_raw[0]]
@@ -360,11 +365,47 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
     if len(grouped) < 2:
         return pd.DataFrame()
 
-    # Column clustering via gap scan
-    col_gap = max(18, int(img_w * 0.02))
-    all_x   = sorted(set(round(item[1]) for group in grouped for item in group))
+    # ── Phase 2: Find header row from raw token groups ────────────
+    # Score each row group directly (no column assignment needed yet).
+    # Using raw text means number-heavy data rows score 0, header rows
+    # score high — we get the header index before touching column layout.
+    all_aliases: set[str] = set()
+    for alias_list in (list(HOLDING_COLUMN_ALIASES.values()) +
+                       list(TRANSACTION_COLUMN_ALIASES.values())):
+        all_aliases.update(a.lower() for a in alias_list)
 
-    def _cluster_xs(xs: list[float], gap: float = col_gap) -> list[float]:
+    def _score_group(group: list[tuple]) -> int:
+        score = 0
+        for _, _, text in group:
+            c = text.lower().strip()
+            if c in all_aliases:
+                score += 2
+            elif difflib.get_close_matches(c, all_aliases, n=1, cutoff=0.7):
+                score += 1
+        return score
+
+    header_group_idx = 0
+    best_header_score = _score_group(grouped[0])
+    for i in range(1, min(10, len(grouped))):
+        s = _score_group(grouped[i])
+        if s > best_header_score:
+            best_header_score, header_group_idx = s, i
+
+    if best_header_score == 0:
+        return pd.DataFrame()
+
+    # ── Phase 3: Derive column centers from header token X positions ──
+    # The header row contains one token per column (e.g. "Symbol", "Shares",
+    # "Cost Basis"). Using these X positions — rather than all tokens across
+    # all rows — avoids false clusters created by dense numeric columns
+    # (commas, decimal points, multi-digit numbers).
+    #
+    # Fallback: if the header row has too few tokens, fall back to global
+    # X clustering from all rows. This handles the case where a header has
+    # been partially OCR'd.
+    col_gap = max(18, int(img_w * 0.02))
+
+    def _cluster_xs(xs: list[float], gap: float) -> list[float]:
         if not xs:
             return []
         cols = [xs[0]]
@@ -375,50 +416,49 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
                 cols[-1] = (cols[-1] + x) / 2
         return cols
 
-    col_centers = _cluster_xs([float(x) for x in all_x])
+    header_xs = sorted(item[1] for item in grouped[header_group_idx])
+    col_centers = _cluster_xs(header_xs, gap=col_gap)
 
-    def nearest_col_idx(x: float) -> int:
-        return int(np.argmin([abs(x - c) for c in col_centers]))
+    if len(col_centers) < 2:
+        # Header too sparse — fall back to global X clustering
+        all_x = sorted(set(round(item[1]) for group in grouped for item in group))
+        col_centers = _cluster_xs([float(x) for x in all_x], gap=col_gap)
+        if len(col_centers) < 2:
+            return pd.DataFrame()
 
-    # Build 2-D grid
+    # ── Phase 4: Column boundary midpoints ───────────────────────
+    # Assign each token to a column using boundary midpoints, not pure
+    # nearest-center. This prevents a token near the edge of col N from
+    # being absorbed into col N+1 just because the centres happen to be
+    # slightly closer together on that row.
+    #
+    # Boundary layout:
+    #   -inf  |  mid(col0,col1)  |  mid(col1,col2)  | ... |  +inf
+    #    col0       col1               col2                   col_last
+    col_boundaries = [float("-inf")]
+    for i in range(len(col_centers) - 1):
+        col_boundaries.append((col_centers[i] + col_centers[i + 1]) / 2)
+    col_boundaries.append(float("inf"))
+
+    def col_idx_for_x(x: float) -> int:
+        for i in range(len(col_centers)):
+            if col_boundaries[i] <= x < col_boundaries[i + 1]:
+                return i
+        return len(col_centers) - 1
+
+    # ── Phase 5: Build 2-D grid and emit DataFrame ────────────────
     table: list[list[str]] = []
     for group in grouped:
         row: list[str] = [""] * len(col_centers)
         for _, x, text in group:
-            ci = nearest_col_idx(x)
+            ci = col_idx_for_x(x)
             row[ci] = (row[ci] + " " + text).strip() if row[ci] else text
         table.append(row)
 
     if len(table) < 2:
         return pd.DataFrame()
 
-    # Score rows to find the best header (search up to first 10 rows)
-    all_aliases: set[str] = set()
-    for alias_list in (list(HOLDING_COLUMN_ALIASES.values()) +
-                       list(TRANSACTION_COLUMN_ALIASES.values())):
-        all_aliases.update(a.lower() for a in alias_list)
-
-    def _score_header(row: list[str]) -> int:
-        score = 0
-        for cell in row:
-            c = cell.lower().strip()
-            if c in all_aliases:
-                score += 2
-            elif difflib.get_close_matches(c, all_aliases, n=1, cutoff=0.7):
-                score += 1
-        return score
-
-    header_idx = 0
-    best = _score_header(table[0])
-    for i in range(1, min(10, len(table))):
-        s = _score_header(table[i])
-        if s > best:
-            best, header_idx = s, i
-
-    if best == 0:
-        return pd.DataFrame()
-
-    headers = table[header_idx]
+    headers = table[header_group_idx]
     seen: dict[str, int] = {}
     clean_headers: list[str] = []
     for h in headers:
@@ -427,4 +467,8 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
         clean_headers.append(h if count == 0 else f"{h}_{count}")
         seen[h] = count + 1
 
-    return pd.DataFrame(table[header_idx + 1:], columns=clean_headers)
+    data_rows = table[header_group_idx + 1:]
+    if not data_rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(data_rows, columns=clean_headers)
