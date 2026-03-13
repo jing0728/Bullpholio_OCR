@@ -2,6 +2,15 @@
 constants/column_aliases.py
 ----------------------------
 All column name alias mappings and required field definitions.
+
+Change log
+──────────
+2024-03  "cost basis" moved from avg_cost_per_share → total_cost.
+         Rationale: in all major broker UIs (Fidelity, Schwab, IBKR),
+         "Cost Basis" = total amount paid for the position (total_cost).
+         "Avg Cost" / "Average Cost" = per-share cost (avg_cost_per_share).
+         Misclassifying it caused OCR sanity warnings on fund tickers
+         (e.g. GTLOX showing avg_cost=1033 when actual total_cost=1033).
 """
 
 HOLDING_COLUMN_ALIASES: dict[str, list[str]] = {
@@ -12,10 +21,14 @@ HOLDING_COLUMN_ALIASES: dict[str, list[str]] = {
     "shares":             ["shares", "quantity", "qty", "units", "position",
                            "shares held", "number of shares", "股数", "数量", "持股数"],
     "avg_cost_per_share": ["avg cost", "average cost", "avg price", "average price",
-                           "cost basis", "avg cost per share", "average cost per share",
+                           "avg cost per share", "average cost per share",
                            "unit cost", "均价", "平均成本", "成本价"],
     "total_cost":         ["total cost", "cost", "book value", "total value",
-                           "book cost", "total book value", "总成本", "账面价值"],
+                           "book cost", "total book value",
+                           # "Cost Basis" in broker UIs = total amount paid, not per-share.
+                           # Fidelity, Schwab, IBKR all use this convention.
+                           "cost basis", "total cost basis",
+                           "总成本", "账面价值", "成本基础"],
     "side":               ["side", "position type", "long/short", "direction",
                            "position side", "多空", "方向"],
     "first_trading_date": ["first trading date", "open date", "first purchase",
