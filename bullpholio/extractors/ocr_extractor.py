@@ -24,8 +24,6 @@ from bullpholio.constants.column_aliases import (
     TRANSACTION_COLUMN_ALIASES,
 )
 
-print("[DEBUG] LOADED bullpholio.extractors.ocr_extractor")
-
 # ── Preprocessing helpers ─────────────────────────────────────────────────────
 
 def _unsharp_mask(gray: np.ndarray, sigma: float = 1.0,
@@ -175,11 +173,8 @@ def _preprocess_strategy_3(image_path: str) -> tuple[str, bool]:
         return image_path, False
 
 
-# ── PaddleOCR startup env var ─────────────────────────────────────────────────
-# Must be set BEFORE `from paddleocr import PaddleOCR` is executed anywhere,
-# otherwise PaddleX fires its 10-second connectivity probe on first import.
-import os as _os
-_os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+# ── Module-level init ────────────────────────────────────────────────────────
+# Nothing needed for PaddleOCR 2.x on Windows — oneDNN issues only affect 3.x.
 
 # ── PaddleOCR Reader cache ────────────────────────────────────────────────────
 # Loading PaddleOCR models takes a few seconds on first call.
@@ -191,14 +186,7 @@ _READER_CACHE: object = None  # PaddleOCR instance, lazily initialised
 def _get_reader():
     """
     Return the cached PaddleOCR instance, initialising it on first call.
-
-    PaddleOCR 2.x constructor: PaddleOCR(use_angle_cls, lang, use_gpu, show_log)
-    PaddleOCR 3.x constructor: PaddleOCR(lang)  — gpu/angle handled automatically,
-                                other kwargs raise TypeError "Unknown argument".
-
-    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK must be set BEFORE the import statement
-    fires; setting it here is too late if the module was already imported elsewhere.
-    Call _ensure_paddle_env() at module import time (bottom of this file) instead.
+    Targets PaddleOCR 2.x (tested on 2.8.1 + paddlepaddle 2.6.2).
     """
     global _READER_CACHE
     if _READER_CACHE is None:
@@ -206,35 +194,27 @@ def _get_reader():
         try:
             from paddleocr import PaddleOCR
         except ImportError:
-            raise ImportError("Missing dependency. Run: pip install paddleocr")
+            raise ImportError("Missing dependency. Run: pip install paddleocr==2.8.1 paddlepaddle==2.6.2")
 
-        # Mute verbose paddle/ppocr INFO output regardless of version.
+        # Mute verbose ppocr INFO output.
         for noisy in ("ppocr", "paddle", "paddleocr", "ppstructure"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
-        # Try PaddleOCR 3.x signature first (minimal args).
-        # Fall back to 2.x signature if that raises TypeError.
-        try:
-            _READER_CACHE = PaddleOCR(lang="en")
-        except TypeError:
-            _READER_CACHE = PaddleOCR(
-                use_angle_cls=True,
-                lang="en",
-                use_gpu=False,
-            )
+        _READER_CACHE = PaddleOCR(
+            use_angle_cls=True,
+            lang="en",
+            use_gpu=False,
+            show_log=False,
+        )
     return _READER_CACHE
 
 
 def warmup_ocr() -> None:
     """
     Pre-warm the PaddleOCR model so the first real image doesn't pay
-    the model-initialisation cost (~4-24s on first call).
-
-    Call this once at program/server startup or at the top of a test suite.
-    A blank white image is used so CRAFT detects nothing and returns immediately —
-    this is about loading the model weights, not producing OCR results.
+    the model-initialisation cost (~4s on first call after install).
+    Call once at program/server startup or at the top of a test suite.
     """
-    import tempfile
     reader = _get_reader()
     dummy  = np.ones((64, 256, 3), dtype=np.uint8) * 255
     tmp    = Path(tempfile.gettempdir()) / "_ocr_warmup.png"
@@ -244,59 +224,15 @@ def warmup_ocr() -> None:
 
 def _run_paddleocr(reader, path: str, conf_min: float = 0.05) -> list[tuple]:
     """
-    Run PaddleOCR on a single image path and return filtered results as
-    a list of (bbox, text, confidence) tuples.
+    Run PaddleOCR (2.x) on a single image and return
+    (bbox, text, confidence) tuples with conf >= conf_min.
 
-    PaddleOCR 2.x API:  reader.ocr(path, cls=True)
-                         raw[0] → list of [bbox, (text, score)]
-
-    PaddleOCR 3.x API:  reader.predict(path)
-                         raw    → list of Result objects (one per image)
-                         result.boxes / result.rec_scores / result.rec_texts
+    PaddleOCR 2.x layout:
+        raw[0]  — list of [bbox, (text, score)] for the page
+        bbox    — [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
     """
     try:
-        # ── Try 3.x predict() API first ──────────────────────────
-        if hasattr(reader, "predict"):
-            raw = reader.predict(path)
-            print(f"\n[DEBUG] OCR path = {path}")
-            print(f"[DEBUG] predict() raw type={type(raw)}, len={len(raw) if raw else 0}")
-
-            if not raw:
-                print("[DEBUG] predict() returned empty")
-                return []
-
-            # Inspect the first result object to discover its attributes
-            first = raw[0]
-            print(f"[DEBUG] raw[0] type={type(first)}")
-            print(f"[DEBUG] raw[0] attrs={[a for a in dir(first) if not a.startswith('_')]}")
-
-            results = []
-            for page_result in raw:
-                texts  = (getattr(page_result, "rec_texts",  None) or
-                          getattr(page_result, "texts",       None) or [])
-                scores = (getattr(page_result, "rec_scores",  None) or
-                          getattr(page_result, "scores",      None) or [])
-                boxes  = (getattr(page_result, "boxes",       None) or
-                          getattr(page_result, "dt_boxes",    None) or [])
-
-                print(f"[DEBUG] texts={texts}")
-                print(f"[DEBUG] scores={scores}")
-
-                for i, (text, conf) in enumerate(zip(texts, scores)):
-                    text = str(text).strip()
-                    conf = float(conf)
-                    print(f"[DEBUG]   text={text!r}  conf={conf:.3f}")
-                    if conf >= conf_min and text:
-                        bbox = boxes[i].tolist() if i < len(boxes) else [[0,0],[0,0],[0,0],[0,0]]
-                        results.append((bbox, text, conf))
-
-            print(f"[DEBUG] kept {len(results)} tokens (conf_min={conf_min})")
-            return results
-
-        # ── Fall back to 2.x ocr() API ────────────────────────────
         raw = reader.ocr(path, cls=True)
-        print(f"\n[DEBUG] OCR path = {path}")
-        print(f"[DEBUG] ocr() raw type={type(raw)}, page len={len(raw[0]) if raw and raw[0] else 0}")
 
         if not raw or raw[0] is None:
             return []
@@ -304,16 +240,13 @@ def _run_paddleocr(reader, path: str, conf_min: float = 0.05) -> list[tuple]:
         results = []
         for line in raw[0]:
             bbox, (text, conf) = line
-            text = str(text).strip()
-            print(f"[DEBUG]   text={text!r}  conf={conf:.3f}")
+            text = text.strip()
             if conf >= conf_min and text:
                 results.append((bbox, text, conf))
 
-        print(f"[DEBUG] kept {len(results)} tokens (conf_min={conf_min})")
         return results
 
-    except Exception as e:
-        print(f"[DEBUG] OCR exception: {type(e).__name__}: {e}")
+    except Exception:
         return []
 
 
@@ -369,11 +302,7 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
         s3_results = _run_paddleocr(reader, s3_path, conf_min=0.05)
         candidates.append(("strategy_3", s3_results))
 
-    for label, results in candidates:
-        print(f"[DEBUG] {label}: {len(results)} tokens")
-
     best_label, best_results = max(candidates, key=lambda x: len(x[1]))
-    print(f"[DEBUG] best OCR strategy = {best_label}, tokens = {len(best_results)}")
 
     if not best_results:
         return pd.DataFrame()
