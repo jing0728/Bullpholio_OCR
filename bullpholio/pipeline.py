@@ -10,12 +10,21 @@ Stage flow:
     3. parse_dataframe()       — DataFrame → DTOs, guided by classifier hint
     4. PipelineResult          — unified result envelope with confidence metadata
 
+Top-level status values:
+    "success"               — all records clean, no sanity warnings
+    "partial"               — some records; skipped rows or parse errors,
+                              but numeric values are plausible
+    "low_confidence_partial"— records extracted but majority of rows flagged
+                              by sanity checks (OCR digit misreads, implausible
+                              costs, etc.).  Recommend manual review.
+    "failed"                — no records extracted
+
 Usage:
     from bullpholio.pipeline import run_pipeline
 
     result = run_pipeline("path/to/file.pdf")
     print(result.status, result.record_count)
-    print(result.classification.reason)         # frontend-ready message
+    print(result.classification.reason)
     for s in result.table_summaries:
         print(s.parse_confidence, s.suspicious_rows, s.confidence_notes)
 """
@@ -30,6 +39,12 @@ from bullpholio.core.classifier import DocumentClassifier
 from bullpholio.core.df_parser import ParseDetail, parse_dataframe
 from bullpholio.extractors.router import extract_tables
 from bullpholio.models.results import PipelineResult, StageError, TableParseSummary
+
+# Threshold: if more than this fraction of extracted records are flagged by
+# sanity checks, escalate status to "low_confidence_partial".
+# 0.5 = majority of rows have suspicious numeric values → not trustworthy enough
+# to call "partial"; user should be prompted to review.
+_LOW_CONFIDENCE_THRESHOLD = 0.50
 
 
 def run_pipeline(
@@ -80,8 +95,6 @@ def run_pipeline(
     logger.info(f"Found {len(dataframes)} table(s) ({stage_latency['extraction']} ms)")
 
     # ── Stage 2: Document Classification ─────────────────────────────────────
-    # Lightweight pass — columns only, no DTO construction.
-    # Result guides which parser to call and provides the frontend reason string.
     logger.info("[2] Classifying document...")
     t = time.monotonic()
     classifier     = DocumentClassifier()
@@ -90,7 +103,6 @@ def run_pipeline(
     logger.info(f"Classification: {classification.doc_type} (confidence={classification.confidence})")
     logger.debug(f"Reason: {classification.reason}")
 
-    # Early exit for non-financial / unsupported
     if not classification.should_parse:
         return PipelineResult(
             status="failed",
@@ -109,8 +121,6 @@ def run_pipeline(
         )
 
     # ── Stage 3: Parse Each DataFrame ────────────────────────────────────────
-    # Pass the classifier's per-table type hint so parse_dataframe can skip
-    # detect_input_type() when the classifier is confident.
     logger.info("[3] Parsing tables...")
     t = time.monotonic()
     parse_errors: list[StageError] = []
@@ -123,10 +133,9 @@ def run_pipeline(
             logger.debug(f"  Table {table_idx}: skipped (non_financial per classifier)")
             continue
 
-        # Pass classifier hint — high-confidence hits skip detect_input_type()
         type_hint = None
         if table_class and table_class.confidence == "high":
-            type_hint = table_class.doc_type  # "holding" | "transaction" | ...
+            type_hint = table_class.doc_type
 
         logger.info(f"  Table {table_idx}: {len(df)} rows × {len(df.columns)} cols"
                     + (f" (hint={type_hint})" if type_hint else ""))
@@ -143,12 +152,6 @@ def run_pipeline(
                         f"(confidence={detail.parse_confidence}, "
                         f"suspicious={detail.suspicious_rows})")
 
-            # Derive parse_status from record count + detail
-            # Rules:
-            #   0 records              → failed
-            #   any skipped rows       → partial_success (data was lost)
-            #   suspicious rows > 30%  → partial_success (most values untrustworthy)
-            #   suspicious rows ≤ 30%  → success with notes (isolated outliers are OK)
             total_rows = max(len(records) + detail.skipped_rows, 1)
             suspicious_ratio = detail.suspicious_rows / total_rows
             if len(records) == 0:
@@ -168,7 +171,7 @@ def run_pipeline(
                 parse_status=parse_status,
                 parse_confidence=detail.parse_confidence,
                 suspicious_rows=detail.suspicious_rows,
-                confidence_notes=detail.notes[:5],  # cap at 5 to keep result lean
+                confidence_notes=detail.notes[:5],
             ))
             if skipped:
                 all_warnings.append(
@@ -196,18 +199,32 @@ def run_pipeline(
     total_ms = elapsed_ms(pipeline_start)
     logger.info(f"[4] Done — {len(all_records)} record(s) total ({total_ms} ms)")
 
-    # Top-level status stays "success" | "partial" | "failed":
-    #   failed  → no records at all
-    #   partial → records extracted but parse_errors OR any table is partial_success
-    #   success → all tables clean
-    has_partial_table = any(
-        s.parse_status == "partial_success" for s in all_summaries
-    )
-    status = (
-        "failed"  if not all_records else
-        "partial" if parse_errors or has_partial_table else
-        "success"
-    )
+    # ── Top-level status ──────────────────────────────────────────────────────
+    #
+    # Priority order (highest specificity first):
+    #   failed               → no records at all
+    #   low_confidence_partial → records exist BUT suspicious_rows > 50% of
+    #                            total records across all tables.  Indicates
+    #                            widespread OCR digit misreads or column
+    #                            misalignment; downstream should prompt review.
+    #   partial              → records exist; some tables had skipped rows or
+    #                          parse errors, but numeric values look plausible
+    #   success              → all tables clean
+    #
+    total_records    = max(len(all_records), 1)
+    total_suspicious = sum(s.suspicious_rows for s in all_summaries)
+    suspicious_ratio = total_suspicious / total_records
+
+    has_partial_table = any(s.parse_status == "partial_success" for s in all_summaries)
+
+    if not all_records:
+        status = "failed"
+    elif suspicious_ratio > _LOW_CONFIDENCE_THRESHOLD:
+        status = "low_confidence_partial"
+    elif parse_errors or has_partial_table:
+        status = "partial"
+    else:
+        status = "success"
 
     return PipelineResult(
         status=status,

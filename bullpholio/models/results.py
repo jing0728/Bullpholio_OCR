@@ -54,9 +54,14 @@ class PipelineResult(BaseModel):
     Unified result envelope — always returned, never raises.
 
     status:
-      "success"        — records extracted, no errors
-      "partial"        — some records extracted, some tables failed or suspicious
-      "failed"         — no records could be extracted
+      "success"               — all records extracted cleanly; no sanity warnings
+      "partial"               — records extracted; some tables failed or had
+                                skipped rows, but numeric values look plausible
+      "low_confidence_partial"— records extracted; but the majority of rows
+                                triggered sanity warnings (e.g. OCR digit misreads,
+                                implausible avg_cost values).  Downstream consumers
+                                should surface a manual-review prompt to the user.
+      "failed"                — no records could be extracted
     """
     status: str
     file_path: str
