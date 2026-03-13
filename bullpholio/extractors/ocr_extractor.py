@@ -245,29 +245,56 @@ def warmup_ocr() -> None:
 def _run_paddleocr(reader, path: str, conf_min: float = 0.05) -> list[tuple]:
     """
     Run PaddleOCR on a single image path and return filtered results as
-    a list of (bbox, text, confidence) tuples — same shape as the old
-    EasyOCR helper so the reconstruction code below is unchanged.
+    a list of (bbox, text, confidence) tuples.
 
-    PaddleOCR result layout:
-        result[0]  — list of detected lines for the first (only) image
-        line       — [bbox, (text, score)]
-        bbox       — [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]  (4-corner polygon)
+    PaddleOCR 2.x API:  reader.ocr(path, cls=True)
+                         raw[0] → list of [bbox, (text, score)]
 
-    The bbox corner order is identical to EasyOCR's, so
-    y_center = (bbox[0][1] + bbox[2][1]) / 2  still works.
+    PaddleOCR 3.x API:  reader.predict(path)
+                         raw    → list of Result objects (one per image)
+                         result.boxes / result.rec_scores / result.rec_texts
     """
     try:
-        raw = reader.ocr(path, cls=True)
+        # ── Try 3.x predict() API first ──────────────────────────
+        if hasattr(reader, "predict"):
+            raw = reader.predict(path)
+            print(f"\n[DEBUG] OCR path = {path}")
+            print(f"[DEBUG] predict() raw type={type(raw)}, len={len(raw) if raw else 0}")
 
+            if not raw:
+                print("[DEBUG] predict() returned empty")
+                return []
+
+            # raw is a list of Result objects, one per image.
+            # Each Result has .boxes (Nx4x2 or Nx8 array), .rec_texts, .rec_scores
+            results = []
+            for page_result in raw:
+                print(f"[DEBUG] page_result type={type(page_result)}")
+                # Attribute names vary slightly by version; check both spellings
+                texts  = (getattr(page_result, "rec_texts",  None) or
+                          getattr(page_result, "texts",       None) or [])
+                scores = (getattr(page_result, "rec_scores",  None) or
+                          getattr(page_result, "scores",      None) or [])
+                boxes  = (getattr(page_result, "boxes",       None) or
+                          getattr(page_result, "dt_boxes",    None) or [])
+
+                print(f"[DEBUG] texts={texts}, scores={scores}")
+
+                for i, (text, conf) in enumerate(zip(texts, scores)):
+                    text = str(text).strip()
+                    conf = float(conf)
+                    print(f"[DEBUG]   text={text!r}  conf={conf:.3f}")
+                    if conf >= conf_min and text:
+                        bbox = boxes[i].tolist() if i < len(boxes) else [[0,0],[0,0],[0,0],[0,0]]
+                        results.append((bbox, text, conf))
+
+            print(f"[DEBUG] kept {len(results)} tokens (conf_min={conf_min})")
+            return results
+
+        # ── Fall back to 2.x ocr() API ────────────────────────────
+        raw = reader.ocr(path, cls=True)
         print(f"\n[DEBUG] OCR path = {path}")
-        print(f"[DEBUG] raw type = {type(raw)}")
-        if raw:
-            page = raw[0]
-            print(f"[DEBUG] raw[0] type = {type(page)}, len = {len(page) if page else 0}")
-            if page:
-                print(f"[DEBUG] raw[0][0] = {page[0]}")
-        else:
-            print("[DEBUG] raw is empty or None")
+        print(f"[DEBUG] ocr() raw type={type(raw)}, page len={len(raw[0]) if raw and raw[0] else 0}")
 
         if not raw or raw[0] is None:
             return []
@@ -275,7 +302,7 @@ def _run_paddleocr(reader, path: str, conf_min: float = 0.05) -> list[tuple]:
         results = []
         for line in raw[0]:
             bbox, (text, conf) = line
-            text = text.strip()
+            text = str(text).strip()
             print(f"[DEBUG]   text={text!r}  conf={conf:.3f}")
             if conf >= conf_min and text:
                 results.append((bbox, text, conf))
