@@ -192,7 +192,7 @@ def _get_reader():
     if _READER_CACHE is None:
         import logging
         try:
-            from paddleocr import PaddleOCR
+            from paddleocr import PaddleOCR  # type: ignore[import-untyped]
         except ImportError:
             raise ImportError("Missing dependency. Run: pip install paddleocr==2.8.1 paddlepaddle==2.6.2")
 
@@ -280,27 +280,48 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
     # filtered later by header scoring and alias matching; the bigger
     # risk is having zero tokens at all on low-quality screenshots.
 
-    # Baseline: original image, no preprocessing
+    # ── Strategy selection ────────────────────────────────────────
+    # Token threshold for "good enough" — if the original image already
+    # produces this many tokens, it is a high-quality screenshot and no
+    # preprocessing strategy will meaningfully improve it.  Skipping all
+    # strategies for these images saves 5-10 s per call (strategy_2 /
+    # adaptive-threshold is the dominant cost and rarely wins on clear
+    # screenshots).
+    #
+    # Empirical calibration:
+    #   stock.png (1366px clear):  original=142  → skip → saves ~6 s
+    #   SPDR.png  (clear):         original=78   → skip → saves ~6 s
+    #   warehouse.png (clear):     original=130  → skip → saves ~7 s
+    #   Low-res / blurry images:   original<20   → try strategies as before
+    _GOOD_ENOUGH_TOKENS = 20
+
     orig_results = _run_paddleocr(reader, image_path, conf_min=0.05)
     candidates: list[tuple[str, list]] = [("original", orig_results)]
 
-    # Strategy 1: tiered upscale + CLAHE + unsharp mask
-    s1_path, s1_modified = _preprocess_strategy_1(image_path)
-    if s1_modified:
-        s1_results = _run_paddleocr(reader, s1_path, conf_min=0.05)
-        candidates.append(("strategy_1", s1_results))
+    if len(orig_results) < _GOOD_ENOUGH_TOKENS:
+        # Original is weak — try preprocessing strategies to recover more tokens.
 
-    # Strategy 2: adaptive threshold
-    s2_path, s2_modified = _preprocess_strategy_2(image_path)
-    if s2_modified:
-        s2_results = _run_paddleocr(reader, s2_path, conf_min=0.05)
-        candidates.append(("strategy_2", s2_results))
+        # Strategy 1: tiered upscale + CLAHE + unsharp mask
+        # Only adds a candidate when the image was actually modified (i.e. small
+        # or blurry); large clear images fall straight through with modified=False.
+        s1_path, s1_modified = _preprocess_strategy_1(image_path)
+        if s1_modified:
+            s1_results = _run_paddleocr(reader, s1_path, conf_min=0.05)
+            candidates.append(("strategy_1", s1_results))
 
-    # Strategy 3: plain grayscale upscale
-    s3_path, s3_modified = _preprocess_strategy_3(image_path)
-    if s3_modified:
-        s3_results = _run_paddleocr(reader, s3_path, conf_min=0.05)
-        candidates.append(("strategy_3", s3_results))
+        # Strategy 2: adaptive threshold — only worthwhile for low-token images.
+        # Always produces a modified image so we gate it on token count, not
+        # modification flag, to avoid a wasted ~5 s OCR call on clear images.
+        s2_path, s2_modified = _preprocess_strategy_2(image_path)
+        if s2_modified:
+            s2_results = _run_paddleocr(reader, s2_path, conf_min=0.05)
+            candidates.append(("strategy_2", s2_results))
+
+        # Strategy 3: plain grayscale upscale (small images only)
+        s3_path, s3_modified = _preprocess_strategy_3(image_path)
+        if s3_modified:
+            s3_results = _run_paddleocr(reader, s3_path, conf_min=0.05)
+            candidates.append(("strategy_3", s3_results))
 
     best_label, best_results = max(candidates, key=lambda x: len(x[1]))
 
