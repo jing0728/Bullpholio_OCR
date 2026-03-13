@@ -1,7 +1,7 @@
 """
 extractors/ocr_extractor.py
 ----------------------------
-Image preprocessing and EasyOCR-based table extraction.
+Image preprocessing and PaddleOCR-based table extraction.
 
 Preprocessing uses a multi-strategy approach:
   Strategy 1 (default):  tiered upscale + auto-invert + CLAHE + unsharp mask
@@ -38,7 +38,7 @@ def _preprocess_strategy_1(image_path: str) -> tuple[str, bool]:
     Default strategy: tiered upscale + auto-invert + CLAHE + unsharp mask.
 
     Upscale targets:
-      Tier C (w < 400):  target 2400px  (was 1600 — more aggressive for tiny images)
+      Tier C (w < 400):  target 1600px
       Tier B (w < 800):  target 1800px
       Tier A (w >= 800): no upscale unless soft
 
@@ -53,14 +53,12 @@ def _preprocess_strategy_1(image_path: str) -> tuple[str, bool]:
         modified = False
 
         if w < 400:
-            # Tier C: very small — upscale targeting 1600px
             scale = max(2.0, 1600 / w)
             img   = cv2.resize(img, None, fx=scale, fy=scale,
                                interpolation=cv2.INTER_LANCZOS4)
             modified = True
             _tier = "C"
         elif w < 800:
-            # Tier B: medium-small — 2× upscale targeting 1800px
             scale = max(2.0, 1800 / w)
             img   = cv2.resize(img, None, fx=scale, fy=scale,
                                interpolation=cv2.INTER_LANCZOS4)
@@ -83,7 +81,7 @@ def _preprocess_strategy_1(image_path: str) -> tuple[str, bool]:
             gray     = clahe.apply(gray)
             modified = True
 
-        # Unsharp mask — skip denoising for Tier C (slow, doesn't help at 330px)
+        # Unsharp mask
         if _tier in ("B", "C"):
             strength = 2.0 if _tier == "C" else 1.5
             gray     = _unsharp_mask(gray, sigma=1.0, strength=strength)
@@ -108,10 +106,6 @@ def _preprocess_strategy_1(image_path: str) -> tuple[str, bool]:
 def _preprocess_strategy_2(image_path: str) -> tuple[str, bool]:
     """
     Adaptive threshold strategy: high contrast boost via adaptive binarisation.
-
-    Good for images with uneven lighting or faint text. Converts to pure
-    black-and-white using adaptive thresholding, which can reveal text that
-    standard CLAHE misses.
     """
     try:
         img = cv2.imread(image_path)
@@ -120,7 +114,6 @@ def _preprocess_strategy_2(image_path: str) -> tuple[str, bool]:
 
         h, w = img.shape[:2]
 
-        # Upscale small images first
         if w < 400:
             scale = max(2.0, 1600 / w)
             img   = cv2.resize(img, None, fx=scale, fy=scale,
@@ -132,16 +125,13 @@ def _preprocess_strategy_2(image_path: str) -> tuple[str, bool]:
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Auto-invert dark backgrounds
         if (gray < 80).sum() / gray.size > 0.55:
             gray = cv2.bitwise_not(gray)
 
-        # Light denoise before binarising
         gray = cv2.fastNlMeansDenoising(gray, h=7,
                                         templateWindowSize=7,
                                         searchWindowSize=21)
 
-        # Adaptive threshold — block size 15, C=4
         binary = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -160,8 +150,6 @@ def _preprocess_strategy_2(image_path: str) -> tuple[str, bool]:
 def _preprocess_strategy_3(image_path: str) -> tuple[str, bool]:
     """
     Plain grayscale fallback — no enhancements except upscale.
-    Sometimes EasyOCR performs better without aggressive preprocessing,
-    especially on already-clear screenshots.
     """
     try:
         img = cv2.imread(image_path)
@@ -170,7 +158,7 @@ def _preprocess_strategy_3(image_path: str) -> tuple[str, bool]:
 
         h, w = img.shape[:2]
         if w >= 800:
-            return image_path, False  # already fine, skip
+            return image_path, False
 
         scale = max(2.0, 1600 / w)
         img   = cv2.resize(img, None, fx=scale, fy=scale,
@@ -185,108 +173,107 @@ def _preprocess_strategy_3(image_path: str) -> tuple[str, bool]:
         return image_path, False
 
 
-# ── EasyOCR Reader cache ──────────────────────────────────────────────────────
-# Loading the CRAFT + recognition models takes ~4s on CPU.
-# We cache the Reader at module level so the cost is paid once per process,
-# not once per image call.  Thread safety is not a concern here because the
-# pipeline processes one file at a time.
+# ── PaddleOCR Reader cache ────────────────────────────────────────────────────
+# Loading PaddleOCR models takes a few seconds on first call.
+# We cache the instance at module level so the cost is paid once per process.
 
-_READER_CACHE: object = None  # easyocr.Reader instance, lazily initialised
+_READER_CACHE: object = None  # PaddleOCR instance, lazily initialised
 
 
 def _get_reader():
-    """Return the cached EasyOCR Reader, initialising it on first call."""
+    """Return the cached PaddleOCR instance, initialising it on first call."""
     global _READER_CACHE
     if _READER_CACHE is None:
         try:
-            import easyocr
+            from paddleocr import PaddleOCR
         except ImportError:
-            raise ImportError("Missing dependency. Run: pip install easyocr")
-        _READER_CACHE = easyocr.Reader(["en"], gpu=False, verbose=False)
+            raise ImportError("Missing dependency. Run: pip install paddleocr")
+        # use_angle_cls=True handles rotated/upside-down text in screenshots.
+        # show_log=False suppresses the verbose PaddlePaddle startup output.
+        _READER_CACHE = PaddleOCR(
+            use_angle_cls=True,
+            lang="en",
+            use_gpu=False,
+            show_log=False,
+        )
     return _READER_CACHE
 
 
-
-
-def _run_easyocr(reader, path: str, conf_min: float = 0.15) -> list[tuple]:
+def _run_paddleocr(reader, path: str, conf_min: float = 0.15) -> list[tuple]:
     """
-    Run EasyOCR on a single image path and return filtered results.
-    Uses mag_ratio=1.5 to help EasyOCR's internal CRAFT detector on small text.
+    Run PaddleOCR on a single image path and return filtered results as
+    a list of (bbox, text, confidence) tuples — same shape as the old
+    EasyOCR helper so the reconstruction code below is unchanged.
+
+    PaddleOCR result layout:
+        result[0]  — list of detected lines for the first (only) image
+        line       — [bbox, (text, score)]
+        bbox       — [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]  (4-corner polygon)
+
+    The bbox corner order is identical to EasyOCR's, so
+    y_center = (bbox[0][1] + bbox[2][1]) / 2  still works.
     """
     try:
-        raw = reader.readtext(
-            path,
-            paragraph=False,
-            mag_ratio=1.5,          # internal magnification — helps tiny text
-            text_threshold=0.6,     # CRAFT text confidence (default 0.7, lowered slightly)
-            low_text=0.35,          # low-bound text score (default 0.4)
-        )
-        return [(bbox, text.strip(), conf)
-                for bbox, text, conf in raw
-                if conf >= conf_min and text.strip()]
+        raw = reader.ocr(path, cls=True)
+        # PaddleOCR wraps results in an outer list (one entry per image).
+        # For a single-image call, raw[0] is the page result.
+        if not raw or raw[0] is None:
+            return []
+        results = []
+        for line in raw[0]:
+            bbox, (text, conf) = line
+            text = text.strip()
+            if conf >= conf_min and text:
+                results.append((bbox, text, conf))
+        return results
     except Exception:
         return []
 
 
 def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
     """
-    Run EasyOCR on a table image and reconstruct a DataFrame.
+    Run PaddleOCR on a table image and reconstruct a DataFrame.
 
-    Fast-fail gates (checked before loading the EasyOCR model):
+    Fast-fail gates (checked before loading the OCR model):
       • Image unreadable by OpenCV → empty DataFrame immediately
       • Both dimensions below OCR minimum → empty DataFrame immediately
-        (CRAFT needs ~20px char height; 400×250 at 3× gives ~15px — marginal)
-        This prevents spending 18s+ on a guaranteed-failure image like trans.png.
 
     Multi-strategy pipeline (only reached for viable images):
       1. Strategy 1: tiered upscale + CLAHE + unsharp mask
       2. Strategy 2: adaptive threshold (only if S1 yields 1–4 tokens)
-      3. Best result used for table reconstruction via Y/X clustering.
+      Best result used for table reconstruction via Y/X clustering.
     """
     # ── Pre-OCR resolution gate ───────────────────────────────────────────────
-    # Check BEFORE initialising the Reader (~4s) or calling readtext (~18s).
-    # Uses the same thresholds as image_extractor so both gates are consistent.
-    # If BOTH dimensions are below OCR minimums, CRAFT cannot detect characters
-    # even after upscaling — return empty immediately.
     img_check = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img_check is None:
         return pd.DataFrame()
     img_h, img_w = img_check.shape
     from bullpholio.extractors.image_extractor import _MIN_OCR_WIDTH, _MIN_OCR_HEIGHT
     if img_w < _MIN_OCR_WIDTH and img_h < _MIN_OCR_HEIGHT:
-        # Too small even after upscaling — CRAFT cannot detect characters.
         return pd.DataFrame()
 
     reader = _get_reader()
 
     # ── Strategy 1 (default) ─────────────────────────────────────
     s1_path, _ = _preprocess_strategy_1(image_path)
-    s1_results = _run_easyocr(reader, s1_path)
+    s1_results = _run_paddleocr(reader, s1_path)
 
     best_results = s1_results
     best_label   = "strategy_1"
 
-    # Early exit: S1 produced enough tokens — no need for fallbacks.
-    # Threshold 5 means "at least a header row + one data row" worth of tokens.
     if len(best_results) >= 5:
-        pass  # fall through to reconstruction
+        pass  # enough tokens — skip fallbacks
 
-    # S1 got something but not enough (1–4 tokens): try S2 once to see if
-    # a different preprocessing reveals more text.
     elif len(best_results) > 0:
         s2_path, modified = _preprocess_strategy_2(image_path)
         if modified:
-            s2_results = _run_easyocr(reader, s2_path)
+            s2_results = _run_paddleocr(reader, s2_path)
             if len(s2_results) > len(best_results):
                 best_results = s2_results
                 best_label   = "strategy_2"
 
-    # S1 got nothing (0 tokens): the image is unreadable at this resolution.
-    # CRAFT text detection failed completely — no preprocessing can recover
-    # text that was never detectable.  Skip S2/S3 to avoid burning ~18s per
-    # wasted readtext call.  Return empty and let the caller surface the error.
     else:
-        pass  # best_results stays []
+        pass  # 0 tokens — skip fallbacks, return empty
 
     if not best_results:
         return pd.DataFrame()
@@ -300,6 +287,7 @@ def _ocr_to_dataframe(image_path: str) -> pd.DataFrame:
 
     rows_raw: list[tuple[float, float, str]] = []
     for bbox, text, conf in best_results:
+        # bbox: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
         y_center = (bbox[0][1] + bbox[2][1]) / 2
         x_center = (bbox[0][0] + bbox[2][0]) / 2
         rows_raw.append((y_center, x_center, text))
