@@ -126,6 +126,7 @@ class TestCase:
     note:         str
     allow_ocr:    bool = False
     open_verdict: bool = False   # Suite C & F
+    base_dir:     Optional[Path] = None  # set by _build_suite_f for Suite F
 
     def status_ok(self, got: str) -> bool:
         if isinstance(self.exp_status, set):
@@ -197,17 +198,23 @@ class SuiteStats:
 # SECTION 2 — Synthetic fixture generation
 # ================================================================
 
-def generate_synthetic_fixtures(out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    _resolve_uploaded_names(out_dir)
-    _gen_borderless_pdfs(out_dir)
-    print(f"{G}Test files ready in:{W} {out_dir}\n")
+def generate_synthetic_fixtures(test_dir: Path) -> None:
+    known_dir = test_dir / "known"
+    new_dir   = test_dir / "new"
+    known_dir.mkdir(parents=True, exist_ok=True)
+    new_dir.mkdir(parents=True, exist_ok=True)
+    _resolve_uploaded_names(known_dir)
+    _gen_borderless_pdfs(known_dir)
+    print(f"{G}Test files ready:{W}")
+    print(f"  regression fixtures → {known_dir}")
+    print(f"  new files to test   → {new_dir}\n")
 
 
 def _resolve_uploaded_names(d: Path) -> None:
     """
-    Locate canonical test files and copy them into test_files/ if absent.
+    Locate canonical test files and copy them into test_files/known/ if absent.
     Handles timestamp-prefixed upload filenames (e.g. '20240315_holdings.csv').
+    Search order: known/ → test_files/ → test/ → project root.
     """
     EXPECTED: dict[str, list[str]] = {
         "holdings.csv":                ["_holdings.csv"],
@@ -230,7 +237,9 @@ def _resolve_uploaded_names(d: Path) -> None:
         "cat.gif":                     ["_cat.gif", "_gif.gif"],
     }
     import shutil
-    search_dirs = [d, d.parent, d.parent.parent]
+    # d is known_dir; also search test_files/ (d.parent), test/ (d.parent.parent),
+    # and project root (d.parent.parent.parent) for legacy flat layouts.
+    search_dirs = [d, d.parent, d.parent.parent, d.parent.parent.parent]
     for clean_name, suffixes in EXPECTED.items():
         target = d / clean_name
         if target.exists():
@@ -423,21 +432,23 @@ def _classify_discovered(fpath: Path) -> str:
     return ext.lstrip(".").upper()
 
 
-def _build_suite_f(test_dir: Path) -> list[TestCase]:
+def _build_suite_f(new_dir: Path) -> list[TestCase]:
     """
-    Scan test_dir/ and return a TestCase for every file not in REGISTRY.
+    Scan test_files/new/ for files not in REGISTRY and return a Suite F TestCase
+    for each one.  Keeping new files in new/ means they never interfere with the
+    A–E regression suite in known/.
 
     Auto-classification:
-      image  → allow_ocr = RUN_OCR  (OCR enabled when --ocr flag present)
+      image  → allow_ocr = RUN_OCR  (enabled when --ocr flag is present)
       other  → allow_ocr = False
-    All Suite F cases have open_verdict=True (any outcome is acceptable).
+    All Suite F cases have open_verdict=True (crash-free is the only requirement).
     """
     known: set[str] = {tc.file.lower() for tc in REGISTRY}
     cases: list[TestCase] = []
-    if not test_dir.exists():
+    if not new_dir.exists():
         return cases
 
-    for fpath in sorted(test_dir.iterdir()):
+    for fpath in sorted(new_dir.iterdir()):
         if not fpath.is_file():
             continue
         if fpath.name.lower() in _IGNORE_FILES:
@@ -459,6 +470,7 @@ def _build_suite_f(test_dir: Path) -> list[TestCase]:
             note="auto-discovered",
             allow_ocr=is_image and RUN_OCR,
             open_verdict=True,
+            base_dir=new_dir,   # Suite F files live in new/
         ))
     return cases
 
@@ -723,6 +735,20 @@ def _print_summary(
 # ================================================================
 
 def run_all(test_dir: Path, run_ocr: bool = False) -> bool:
+    """
+    Run all suites.
+
+    Directory layout:
+      test_files/known/  — regression fixtures for Suites A–E
+      test_files/new/    — new files scanned automatically into Suite F
+
+    Each TestCase resolves its file against:
+      tc.base_dir  if set (Suite F cases point to new/)
+      known_dir    otherwise (Suites A–E)
+    """
+    known_dir = test_dir / "known"
+    new_dir   = test_dir / "new"
+
     logger = logging.getLogger("pipeline.test")
     logger.setLevel(logging.WARNING)
 
@@ -730,7 +756,7 @@ def run_all(test_dir: Path, run_ocr: bool = False) -> bool:
         print(f"\n{Y}  Suite C (OCR screenshots) skipped — pass --ocr to enable{W}")
 
     # Build complete case list: registry + auto-discovered Suite F
-    all_cases: list[TestCase] = list(REGISTRY) + _build_suite_f(test_dir)
+    all_cases: list[TestCase] = list(REGISTRY) + _build_suite_f(new_dir)
 
     # Initialise per-suite stats
     suite_stats: dict[str, SuiteStats] = {
@@ -759,11 +785,13 @@ def run_all(test_dir: Path, run_ocr: bool = False) -> bool:
             print(f"\n{'═'*62}")
             print(f"{B}Suite {suite_id}: {_SUITE_LABELS[suite_id]}{W}")
             if suite_id == "F":
-                print(f"{D}  {len(cases)} file(s) auto-discovered in test_files/{W}")
+                print(f"{D}  {len(cases)} file(s) auto-discovered in test_files/new/{W}")
             print(f"{'═'*62}")
 
         for tc in cases:
-            fpath = test_dir / tc.file
+            # Suite F TestCases carry their own base_dir (new/);
+            # all other cases resolve against known/.
+            fpath = (tc.base_dir / tc.file) if tc.base_dir else (known_dir / tc.file)
 
             # ── Determine if we should skip ───────────────────────
             skip_reason = ""
@@ -865,7 +893,7 @@ if __name__ == "__main__":
     args     = [a for a in sys.argv[1:] if not a.startswith("--")]
 
     print(f"\n{B}Preparing test files (if missing)...{W}")
-    generate_synthetic_fixtures(test_dir)
+    generate_synthetic_fixtures(test_dir)   # creates known/ and new/ if absent
 
     if args:
         run_single(args[0], allow_ocr=RUN_OCR)
