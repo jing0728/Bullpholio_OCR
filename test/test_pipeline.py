@@ -1,38 +1,62 @@
 """
 test_pipeline.py
 ----------------
-Pipeline test suite — uses real uploaded broker files where available,
-generates synthetic fixtures for edge-case scenarios.
+Production testing harness for the Bullpholio document ingestion pipeline.
 
-Usage:
-    python test/test_pipeline.py                   # full suite, compact output
-    python test/test_pipeline.py --ocr             # include Suite C OCR cases
-    python test/test_pipeline.py --ocr --verbose   # full warnings + table summaries
-    python test/test_pipeline.py --quiet           # pass/fail only, no records
-    python test/test_pipeline.py path/to/file.pdf  # single file ad-hoc
-    python test/test_pipeline.py path/to/file.pdf --ocr --verbose
+Architecture
+────────────
+  TestCase     — typed descriptor: what file, what to expect, which suite
+  TestResult   — outcome of one run: pass/fail, latency, sanity flags
+  SuiteStats   — per-suite aggregates (pass rate, avg latency)
+  RunStats     — global statistics collector driving the summary report
 
-Output levels
-─────────────
-  default   status · input_type · record_count · latency · 2 sample records
-            · warning count + first warning · errors (always shown)
-  --verbose all of the above + full warnings + table summaries
-  --quiet   status line only (pass/fail), no records
+Auto-scan
+─────────
+  Suite F is built at runtime by scanning test_files/ for any file not
+  already registered in suites A–E.  Drop a new file in test_files/ and
+  it is picked up automatically on the next run — no code change needed.
 
-Test suite structure
-────────────────────
-Suite A — Structured files (CSV / Excel / PDF / Word)
-Suite B — Borderless text PDFs  (Pass 3 word-layout)
-Suite C — OCR screenshots        [requires --ocr]
-Suite D — Non-financial docs     (must fail cleanly)
-Suite E — Hard rejections        (must fail cleanly)
+  Auto-classification assigns each discovered file to the most appropriate
+  category based on its extension:
+    structured (CSV/Excel/PDF/Word) → Suite F-S (open verdict, no OCR)
+    image                           → Suite F-I (open verdict, OCR if --ocr)
+
+OCR statistics
+──────────────
+  All cases that ran with allow_ocr=True (Suite C + any Suite F image)
+  are collected into a dedicated OCR breakdown table in the summary:
+    • success rate (images that produced ≥1 record)
+    • average records per successful image
+    • average latency
+    • per-image status / record count / sanity warning count
+
+Expected pass/fail enforcement
+───────────────────────────────
+  Suites A–E have strict expectations (exp_status, exp_type, exp_min).
+  Failing to meet them marks the case RED and increments the failure count.
+  Suite C is always "open verdict" — any status is acceptable.
+  Suite F is always "open verdict" — crash-free is the only requirement.
+
+Usage
+─────
+  python test/test_pipeline.py                   # full suite, default output
+  python test/test_pipeline.py --ocr             # include OCR cases
+  python test/test_pipeline.py --ocr --verbose   # full warnings + table summaries
+  python test/test_pipeline.py --quiet           # one line per test + summary
+  python test/test_pipeline.py path/to/file.pdf  # single file ad-hoc
+  python test/test_pipeline.py path/to/file.pdf --ocr --verbose
 """
+
+from __future__ import annotations
 
 import sys
 import logging
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional, Union
 
-# ── Locate pipeline module ────────────────────────────────────────
+# ── Locate pipeline module ────────────────────────────────────────────────────
 _here = Path(__file__).parent
 sys.path.insert(0, str(_here.parent))
 sys.path.insert(0, str(_here))
@@ -40,39 +64,152 @@ sys.path.insert(0, str(_here))
 from bullpholio.pipeline import run_pipeline
 from bullpholio.models.results import PipelineResult
 
-# ── CLI flags ─────────────────────────────────────────────────────
+# ── CLI flags (parsed once at import time) ────────────────────────────────────
 VERBOSE = "--verbose" in sys.argv
 QUIET   = "--quiet"   in sys.argv
+RUN_OCR = "--ocr"     in sys.argv
 
-# ── Colour helpers ────────────────────────────────────────────────
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
+# ── Colour helpers ────────────────────────────────────────────────────────────
+G  = "\033[92m"   # green
+R  = "\033[91m"   # red
+Y  = "\033[93m"   # yellow
+C  = "\033[96m"   # cyan
+W  = "\033[0m"    # reset
+B  = "\033[1m"    # bold
+D  = "\033[2m"    # dim
 
-def ok(msg):    print(f"  {GREEN}✓{RESET} {msg}")
-def fail(msg):  print(f"  {RED}✗{RESET} {msg}")
-def warn(msg):  print(f"  {YELLOW}!{RESET} {msg}")
-def info(msg):  print(f"  {CYAN}→{RESET} {msg}")
-def dim(msg):   print(f"  {DIM}{msg}{RESET}")
+def _ok(s):   print(f"  {G}✓{W} {s}")
+def _fail(s): print(f"  {R}✗{W} {s}")
+def _warn(s): print(f"  {Y}!{W} {s}")
+def _info(s): print(f"  {C}→{W} {s}")
+def _dim(s):  print(f"  {D}{s}{W}")
+
+# Sentinel meaning "accept any pipeline status"
+_ANY: set[str] = {"success", "partial", "low_confidence_partial", "failed"}
+
+# ── Supported extensions ──────────────────────────────────────────────────────
+_IMAGE_EXTS:  set[str] = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
+_STRUCT_EXTS: set[str] = {".csv", ".xlsx", ".pdf", ".docx"}
+_SCANNABLE:   set[str] = _IMAGE_EXTS | _STRUCT_EXTS
+_IGNORE_FILES: set[str] = {"desktop.ini", ".ds_store", "thumbs.db"}
 
 
 # ================================================================
-# SECTION 1 — Synthetic fixture generation
+# SECTION 1 — Data model
+# ================================================================
+
+@dataclass
+class TestCase:
+    """
+    Describes a single pipeline test.
+
+    Fields
+    ──────
+    label       display name shown in output
+    file        filename relative to test_files/
+    suite       A | B | C | D | E | F
+    exp_status  expected PipelineResult.status — str or set[str]
+                pass _ANY to accept any status (Suite C, F)
+    exp_type    expected input_type, or None to skip that check
+    exp_min     minimum acceptable record_count  (0 = don't check)
+    note        one-line description of what this case tests
+    allow_ocr   whether to pass allow_ocr=True to run_pipeline
+    open_verdict if True, test always passes regardless of output
+                 (used for Suite C and F — we just want no crash)
+    """
+    label:        str
+    file:         str
+    suite:        str
+    exp_status:   Union[str, set[str]]
+    exp_type:     Optional[str]
+    exp_min:      int
+    note:         str
+    allow_ocr:    bool = False
+    open_verdict: bool = False   # Suite C & F
+
+    def status_ok(self, got: str) -> bool:
+        if isinstance(self.exp_status, set):
+            return got in self.exp_status
+        return got == self.exp_status
+
+
+@dataclass
+class TestResult:
+    """
+    Outcome of running one TestCase.
+
+    passed       False only when a strict expectation was not met.
+                 Cases with open_verdict=True are always True.
+    skipped      File missing, or Suite C without --ocr.
+    assertions   List of (assertion_label, ok_bool) for the case detail view.
+    """
+    tc:          TestCase
+    result:      Optional[PipelineResult]
+    passed:      bool
+    skipped:     bool       = False
+    skip_reason: str        = ""
+    wall_ms:     float      = 0.0
+    assertions:  list[tuple[str, bool]] = field(default_factory=list)
+
+    # ── Convenience properties ────────────────────────────────────
+    @property
+    def label(self)        -> str:            return self.tc.label
+    @property
+    def suite(self)        -> str:            return self.tc.suite
+    @property
+    def is_ocr(self)       -> bool:           return self.tc.allow_ocr
+    @property
+    def record_count(self) -> int:
+        return self.result.record_count if self.result else 0
+    @property
+    def sanity_count(self) -> int:
+        if not self.result:
+            return 0
+        return sum(s.suspicious_rows for s in self.result.table_summaries)
+    @property
+    def latency_ms(self)   -> float:
+        return self.result.total_latency_ms if self.result else 0.0
+
+
+@dataclass
+class SuiteStats:
+    """Per-suite pass / latency aggregates."""
+    suite_id:  str
+    label:     str
+    total:     int         = 0
+    run:       int         = 0   # total - skipped
+    passed:    int         = 0
+    failed:    int         = 0
+    skipped:   int         = 0
+    latencies: list[float] = field(default_factory=list)
+
+    @property
+    def pass_rate(self) -> float:
+        return (self.passed / self.run * 100) if self.run else 0.0
+
+    @property
+    def avg_ms(self) -> Optional[float]:
+        vals = [v for v in self.latencies if v > 0]
+        return sum(vals) / len(vals) if vals else None
+
+
+# ================================================================
+# SECTION 2 — Synthetic fixture generation
 # ================================================================
 
 def generate_synthetic_fixtures(out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     _resolve_uploaded_names(out_dir)
     _gen_borderless_pdfs(out_dir)
-    print(f"{GREEN}Test files ready in:{RESET} {out_dir}\n")
+    print(f"{G}Test files ready in:{W} {out_dir}\n")
 
 
 def _resolve_uploaded_names(d: Path) -> None:
-    EXPECTED = {
+    """
+    Locate canonical test files and copy them into test_files/ if absent.
+    Handles timestamp-prefixed upload filenames (e.g. '20240315_holdings.csv').
+    """
+    EXPECTED: dict[str, list[str]] = {
         "holdings.csv":                ["_holdings.csv"],
         "holdings.docx":               ["_holdings.docx"],
         "holdings.pdf":                ["_holdings.pdf"],
@@ -92,53 +229,48 @@ def _resolve_uploaded_names(d: Path) -> None:
         "flower.bmp":                  ["_flower.bmp"],
         "cat.gif":                     ["_cat.gif", "_gif.gif"],
     }
-    search_dirs = [d, d.parent, d.parent.parent]
     import shutil
+    search_dirs = [d, d.parent, d.parent.parent]
     for clean_name, suffixes in EXPECTED.items():
         target = d / clean_name
         if target.exists():
             continue
-        found = None
+        found: Optional[Path] = None
         for sd in search_dirs:
-            candidate = sd / clean_name
-            if candidate.exists() and candidate != target:
-                found = candidate
-                break
+            cand = sd / clean_name
+            if cand.exists() and cand != target:
+                found = cand; break
         if not found:
             for sd in search_dirs:
                 if not sd.exists():
                     continue
                 for f in sd.iterdir():
-                    for suffix in suffixes:
-                        if f.name.endswith(suffix) and f != target:
-                            found = f
-                            break
-                    if found:
-                        break
+                    if any(f.name.endswith(sfx) for sfx in suffixes) and f != target:
+                        found = f; break
                 if found:
                     break
         if found:
             shutil.copy2(found, target)
-            print(f"  {CYAN}Copied{RESET} {found.name} → test_files/{clean_name}")
+            print(f"  {C}Copied{W} {found.name} → test_files/{clean_name}")
 
 
 def _gen_borderless_pdfs(d: Path) -> None:
+    """Generate synthetic borderless PDFs for Suite B (Pass 3 tests)."""
     try:
         from fpdf import FPDF
     except ImportError:
-        print(f"{YELLOW}  fpdf2 not installed — skipping borderless PDF generation{RESET}")
+        print(f"{Y}  fpdf2 not installed — skipping borderless PDF generation{W}")
         return
 
-    def _make(path, title, headers, rows, col_x):
+    def _make(path: Path, title: str, headers: list, rows: list, col_x: list) -> None:
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Courier", "B", 13)
-        pdf.set_xy(10, 10)
-        pdf.cell(0, 8, title)
+        pdf.set_xy(10, 10);  pdf.cell(0, 8, title)
         pdf.set_font("Courier", "B", 10)
         y = 25
         for h, x in zip(headers, col_x):
-            pdf.set_xy(x, y); pdf.cell(0, 8, h)
+            pdf.set_xy(x, y);  pdf.cell(0, 8, h)
         y += 8
         pdf.set_draw_color(150, 150, 150)
         pdf.line(10, y, 200, y)
@@ -146,10 +278,10 @@ def _gen_borderless_pdfs(d: Path) -> None:
         pdf.set_font("Courier", "", 10)
         for row in rows:
             for val, x in zip(row, col_x):
-                pdf.set_xy(x, y); pdf.cell(0, 8, str(val))
+                pdf.set_xy(x, y);  pdf.cell(0, 8, str(val))
             y += 8
         pdf.output(str(path))
-        print(f"  {GREEN}Generated{RESET} {Path(path).name}")
+        print(f"  {G}Generated{W} {path.name}")
 
     if not (d / "holdings_borderless.pdf").exists():
         _make(d / "holdings_borderless.pdf",
@@ -167,8 +299,8 @@ def _gen_borderless_pdfs(d: Path) -> None:
     if not (d / "transactions_borderless.pdf").exists():
         _make(d / "transactions_borderless.pdf",
               "Transaction History - Borderless Layout",
-              ["Symbol", "Type", "Shares", "Price",   "Total",   "Commission", "Net Amt",  "Date"],
-              col_x=[10,   38,    62,        92,        125,        160,          195,        235],
+              ["Symbol", "Type",  "Shares", "Price",   "Total",   "Commission", "Net Amt",  "Date"],
+              col_x=[10,   38,     62,        92,        125,        160,          195,        235],
               rows=[
                   ["AAPL", "buy",  "50.0", "178.90", "8945.00", "1.00", "8946.15", "2024-01-10"],
                   ["TSLA", "sell", "30.0", "215.50", "6465.00", "1.00", "6464.00", "2024-01-15"],
@@ -179,443 +311,564 @@ def _gen_borderless_pdfs(d: Path) -> None:
 
 
 # ================================================================
-# SECTION 2 — Test case definitions
+# SECTION 3 — Test case registry  (Suites A–E)
 # ================================================================
 
-TEST_CASES = [
-    # ── Suite A ──────────────────────────────────────────────────
-    dict(label="Holdings CSV",
-         file="holdings.csv", suite="A",
-         exp_status="success", exp_type="holding", exp_min=4,
-         note="Real CSV — symbol/shares/avg_cost/total_cost columns"),
-    dict(label="Transactions CSV",
-         file="transactions.csv", suite="A",
-         exp_status="success", exp_type="transaction", exp_min=5,
-         note="Real CSV — commission/fees/net_amount columns"),
-    dict(label="Holdings Excel",
-         file="holdings.xlsx", suite="A",
-         exp_status="success", exp_type="holding", exp_min=4,
-         note="Real .xlsx holdings — same schema as CSV"),
-    dict(label="Transactions Excel",
-         file="transactions.xlsx", suite="A",
-         exp_status="success", exp_type="transaction", exp_min=5,
-         note="Real .xlsx transactions — commission/fees/net_amount columns"),
-    dict(label="Holdings PDF",
-         file="holdings.pdf", suite="A",
-         exp_status="success", exp_type="holding", exp_min=5,
-         note="Real bordered PDF holdings table"),
-    dict(label="Transactions PDF",
-         file="transactions.pdf", suite="A",
-         exp_status="success", exp_type="transaction", exp_min=5,
-         note="Real bordered PDF transactions table"),
-    dict(label="Holdings Word",
-         file="holdings.docx", suite="A",
-         exp_status="success", exp_type="holding", exp_min=3,
-         note="Real .docx table — symbol/name/shares/avg_cost/total_cost/side"),
-    dict(label="Mixed Statement PDF",
-         file="mixed_statement.pdf", suite="A",
-         exp_status="success", exp_type="mixed", exp_min=4,
-         note="Single PDF with a holdings section AND a transactions section → type=mixed"),
+REGISTRY: list[TestCase] = [
 
-    # ── Suite B ──────────────────────────────────────────────────
-    dict(label="Borderless Holdings PDF",
-         file="holdings_borderless.pdf", suite="B",
-         exp_status="success", exp_type="holding", exp_min=5,
-         note="No grid lines — Pass 3 word-layout; includes 0-share row (TSLA)"),
-    dict(label="Borderless Transactions PDF",
-         file="transactions_borderless.pdf", suite="B",
-         exp_status="success", exp_type="transaction", exp_min=5,
-         note="No grid lines — Pass 3; has commission + net_amount columns"),
+    # ── Suite A: Structured files — strict expectations ───────────────────────
+    TestCase("Holdings CSV",        "holdings.csv",       "A",
+             "success", "holding",     4,
+             "CSV with symbol / shares / avg_cost / total_cost columns"),
+    TestCase("Transactions CSV",    "transactions.csv",   "A",
+             "success", "transaction", 5,
+             "CSV with commission / fees / net_amount columns"),
+    TestCase("Holdings Excel",      "holdings.xlsx",      "A",
+             "success", "holding",     4,
+             "xlsx — same schema as holdings.csv"),
+    TestCase("Transactions Excel",  "transactions.xlsx",  "A",
+             "success", "transaction", 5,
+             "xlsx with commission / fees / net_amount"),
+    TestCase("Holdings PDF",        "holdings.pdf",       "A",
+             "success", "holding",     5,
+             "Bordered PDF with holdings table"),
+    TestCase("Transactions PDF",    "transactions.pdf",   "A",
+             "success", "transaction", 5,
+             "Bordered PDF with transactions table"),
+    TestCase("Holdings Word",       "holdings.docx",      "A",
+             "success", "holding",     3,
+             "Word table with symbol / name / shares / avg_cost / side"),
+    TestCase("Mixed Statement PDF", "mixed_statement.pdf","A",
+             "success", "mixed",       4,
+             "One PDF containing both a holdings and a transactions section"),
 
-    # ── Suite C ──────────────────────────────────────────────────
-    dict(label="Broker Transactions Screenshot (trans.png)",
-         file="trans.png", suite="C", allow_ocr=True,
-         exp_status={"success", "partial", "low_confidence_partial", "failed"},
-         exp_type=None, exp_min=0,
-         note="Very low-res Schwab screenshot (404×125px) — expect fast rejection"),
-    dict(label="Investment Portfolio Screenshot (stock.png)",
-         file="stock.png", suite="C", allow_ocr=True,
-         exp_status={"success", "partial", "low_confidence_partial"},
-         exp_type="holding", exp_min=3,
-         note="Fidelity-style portfolio — Symbol/Shares/Cost Basis; 12 holdings"),
-    dict(label="SPY Holdings Screenshot (SPDR.png)",
-         file="SPDR.png", suite="C", allow_ocr=True,
-         exp_status={"success", "partial", "low_confidence_partial", "failed"},
-         exp_type=None, exp_min=0,
-         note="stockanalysis.com SPY — %Weight/%Change, no Shares; 0 records OK"),
-    dict(label="Warehouse Storage Screenshot (warehouse.png)",
-         file="warehouse.png", suite="C", allow_ocr=True,
-         exp_status={"partial", "failed"}, exp_type=None, exp_min=0,
-         note="ERP table — Inventory ID/Qty; not financial → MissingRequiredColumns"),
+    # ── Suite B: Borderless PDFs — Pass 3 word-layout reconstruction ──────────
+    TestCase("Borderless Holdings PDF",
+             "holdings_borderless.pdf",     "B",
+             "success", "holding",     5,
+             "No grid lines; TSLA 0-share row must be kept"),
+    TestCase("Borderless Transactions PDF",
+             "transactions_borderless.pdf", "B",
+             "success", "transaction", 5,
+             "No grid lines; has commission + net_amount columns"),
 
-    # ── Suite D ──────────────────────────────────────────────────
-    dict(label="FCS Automotive Invoice (test.pdf)",
-         file="test.pdf", suite="D",
-         exp_status="failed", exp_type=None, exp_min=0,
-         note="8-page invoice — no symbol/shares → must be rejected"),
+    # ── Suite C: OCR broker screenshots — open verdict ────────────────────────
+    # Any pipeline status is acceptable; we only check it does not crash.
+    TestCase("Broker Transactions Screenshot",
+             "trans.png",    "C", _ANY, None, 0,
+             "Very low-res Schwab screenshot (404×125 px) → fast rejection expected",
+             allow_ocr=True, open_verdict=True),
+    TestCase("Investment Portfolio Screenshot",
+             "stock.png",    "C",
+             {"success", "partial", "low_confidence_partial"}, "holding", 3,
+             "Fidelity-style UI — Symbol / Shares / Cost Basis; 12 holdings rows",
+             allow_ocr=True, open_verdict=True),
+    TestCase("SPY Holdings Screenshot",
+             "SPDR.png",     "C", _ANY, None, 0,
+             "stockanalysis.com — %Weight / %Change, no Shares; 0 records OK",
+             allow_ocr=True, open_verdict=True),
+    TestCase("Warehouse Storage Screenshot",
+             "warehouse.png","C",
+             {"partial", "failed"}, None, 0,
+             "ERP table — Inventory ID / Qty; not financial → MissingRequiredColumns",
+             allow_ocr=True, open_verdict=True),
 
-    # ── Suite E ──────────────────────────────────────────────────
-    dict(label="Non-table photo (flower.jpg)",
-         file="flower.jpg", suite="E",
-         exp_status="failed", exp_type=None, exp_min=0,
-         note="Plain JPEG photo → rejected before OCR"),
-    dict(label="Non-table photo (flower.bmp)",
-         file="flower.bmp", suite="E",
-         exp_status="failed", exp_type=None, exp_min=0,
-         note="BMP photo → rejected before OCR"),
-    dict(label="Animal GIF (cat.gif)",
-         file="cat.gif", suite="E",
-         exp_status="failed", exp_type=None, exp_min=0,
-         note="Cat photo GIF → rejected by _has_table_structure"),
+    # ── Suite D: Non-financial documents — must fail cleanly ──────────────────
+    TestCase("FCS Automotive Invoice",
+             "test.pdf",     "D",
+             "failed", None, 0,
+             "8-page invoice — Line ID / Rate / Amount; no symbol or shares field"),
+
+    # ── Suite E: Hard rejection images — must fail cleanly ───────────────────
+    TestCase("Non-table photo (flower.jpg)",
+             "flower.jpg",   "E",
+             "failed", None, 0,
+             "Plain JPEG flower photo → rejected at image_no_table gate"),
+    TestCase("Non-table photo (flower.bmp)",
+             "flower.bmp",   "E",
+             "failed", None, 0,
+             "BMP photo → rejected at image_no_table gate"),
+    TestCase("Animal GIF (cat.gif)",
+             "cat.gif",      "E",
+             "failed", None, 0,
+             "Cat photo GIF → rejected by _has_table_structure"),
 ]
 
-
-# ================================================================
-# SECTION 3 — Record formatter
-# ================================================================
-
-# Core fields shown per DTO type — keeps sample output human-readable
-_CORE_FIELDS: dict[str, list[str]] = {
-    "broker_holding":      ["symbol", "shares", "avg_cost_per_share", "total_cost", "side"],
-    "transaction":         ["symbol", "transaction_move", "shares", "price_per_share",
-                            "total_amount", "executed_at"],
-    "constituent_holding": ["symbol", "weight", "price", "change"],
-}
-
-def _format_record(rec: dict) -> dict:
-    """Return only core fields for the DTO type, dropping nulls/zeros."""
-    keys = _CORE_FIELDS.get(rec.get("dto_type", ""), list(rec.keys()))
-    return {k: rec[k] for k in keys if k in rec and rec[k] not in (None, "", 0.0, 0)}
-
-
-# ================================================================
-# SECTION 4 — Result printer
-# ================================================================
-
-def print_result(result: PipelineResult, tc: dict) -> bool:
-    """Print a result at the configured verbosity level. Returns True if passed."""
-    passed     = True
-    exp_status = tc["exp_status"]
-    exp_type   = tc.get("exp_type")
-    exp_min    = tc.get("exp_min", 1)
-    suite      = tc["suite"]
-
-    if QUIET:
-        # ── Quiet: single status line ─────────────────────────────
-        status_ok = (result.status in exp_status
-                     if isinstance(exp_status, set)
-                     else result.status == exp_status)
-        if not status_ok:
-            fail(f"status={result.status!r}  expected={exp_status!r}")
-            passed = False
-        elif result.record_count < exp_min:
-            fail(f"record_count={result.record_count}  expected>={exp_min}")
-            passed = False
-        return passed
-
-    # ── Status ────────────────────────────────────────────────────
-    status_ok = (result.status in exp_status
-                 if isinstance(exp_status, set)
-                 else result.status == exp_status)
-    if status_ok:
-        ok(f"status = {result.status}")
-    else:
-        fail(f"status = {result.status!r}  (expected {exp_status!r})")
-        passed = False
-
-    # ── Hard-rejection suites: show reason and return early ───────
-    if suite in ("D", "E"):
-        if result.errors:
-            dim(f"rejection: {result.errors[0].message[:110]}")
-        return passed
-
-    # ── Input type ────────────────────────────────────────────────
-    if exp_type:
-        if result.input_type == exp_type:
-            ok(f"input_type = {result.input_type}")
-        else:
-            fail(f"input_type = {result.input_type!r}  (expected {exp_type!r})")
-            passed = False
-    else:
-        info(f"input_type = {result.input_type}  (not checked)")
-
-    # ── Record count ──────────────────────────────────────────────
-    if result.record_count >= exp_min:
-        ok(f"record_count = {result.record_count}")
-    else:
-        fail(f"record_count = {result.record_count}  (expected >= {exp_min})")
-        passed = False
-
-    # ── Latency ───────────────────────────────────────────────────
-    info(f"latency = {result.total_latency_ms:.0f} ms")
-
-    # ── Sample records ────────────────────────────────────────────
-    if result.data:
-        # Suite C: show parsed table type + prominent OCR label
-        if suite == "C":
-            info(f"parsed_table_type = {result.input_type or 'unknown'}")
-            info("OCR extracted:")
-        else:
-            info("sample records:")
-        for rec in result.data[:3 if suite == "C" else 2]:
-            print(f"      {_format_record(rec.model_dump())}")
-    else:
-        info("sample records: none")
-
-    # ── Warnings: summary by default, full list in verbose ────────
-    if result.warnings:
-        # Filter to user-actionable warnings only — suppress routing noise
-        # (lines that only contain "input_type=..." with no other context)
-        actionable = [
-            w for w in result.warnings
-            if not (w.startswith("input_type=") and "(" in w and len(w) < 60)
-        ]
-        if actionable:
-            if VERBOSE:
-                for w in actionable:
-                    warn(w)
-            else:
-                warn(f"{len(actionable)} warning(s)  — run --verbose to see all")
-                # Representative summary line: prefer a MissingRequiredColumns or
-                # rows_skipped message over a per-row sanity detail, because those
-                # are structural issues that affect the whole table.
-                summary = next(
-                    (w for w in actionable
-                     if w.startswith("[MissingRequiredColumns]")
-                     or "row" in w.lower() and "skipped" in w.lower()),
-                    None,
-                )
-                if summary is None and any("[sanity]" in w for w in actionable):
-                    # All warnings are sanity notes — show a generic message
-                    # instead of a per-row detail so the output reads like a report
-                    n_sanity = sum(1 for w in actionable if "[sanity]" in w)
-                    summary = (
-                        f"OCR extracted table, but {n_sanity} row(s) have "
-                        "numeric fields that may be misaligned — verify manually."
-                    )
-                if summary is None:
-                    summary = actionable[0]
-                warn(summary[:120])
-
-    # ── Table summaries (verbose only) ────────────────────────────
-    if VERBOSE and result.table_summaries:
-        info("table summaries:")
-        for s in result.table_summaries:
-            flag = "SKIP" if s.skipped else "OK  "
-            conf = f"conf={s.parse_confidence}" if s.parse_confidence != "high" else ""
-            susp = f"suspicious={s.suspicious_rows}" if s.suspicious_rows else ""
-            meta = "  ".join(x for x in [conf, susp] if x)
-            print(f"      [{flag}] table {s.table_index}: {s.input_type}, "
-                  f"{s.row_count} rows → {s.record_count} records"
-                  + (f"  [{meta}]" if meta else ""))
-
-    # ── Errors ────────────────────────────────────────────────────
-    # Suite C: any outcome is acceptable — show as info
-    if result.errors and suite != "C":
-        for e in result.errors:
-            fail(f"[{e.stage}] {e.error_type}: {e.message[:100]}")
-            passed = False
-    elif result.errors and suite == "C":
-        for e in result.errors:
-            info(f"rejection: {e.message[:110]}")
-
-    return passed
-
-
-# ================================================================
-# SECTION 5 — Suite runners
-# ================================================================
-
-_SUITE_LABELS = {
-    "A": "Structured files (CSV / Excel / PDF / Word)",
-    "B": "Borderless text PDFs  — Pass 3 word-layout",
-    "C": "OCR screenshots  — allow_ocr=True",
-    "D": "Non-financial documents  — must fail cleanly",
-    "E": "Hard rejections  — must fail cleanly",
-    "F": "Auto-discovered files  — no expected outcome",
-}
-
-# Extensions the pipeline can handle — used by the directory scanner.
-_SCANNABLE_EXTENSIONS: set[str] = {
-    ".csv", ".xlsx", ".pdf", ".docx",
-    ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp",
-}
-
-# Filenames to silently ignore during auto-scan (OS/editor artefacts).
-_SCAN_IGNORE: set[str] = {
-    "desktop.ini", ".ds_store", "thumbs.db",
+# ── Suite labels ──────────────────────────────────────────────────────────────
+_SUITE_LABELS: dict[str, str] = {
+    "A": "Structured files — strict expectations",
+    "B": "Borderless text PDFs — Pass 3 word-layout",
+    "C": "OCR screenshots — allow_ocr=True (open verdict)",
+    "D": "Non-financial documents — must fail cleanly",
+    "E": "Hard rejections (photos / GIFs) — must fail cleanly",
+    "F": "Auto-discovered — open verdict, crash-free required",
 }
 
 
-def _build_suite_f(test_dir: Path, run_ocr: bool) -> list[dict]:
+# ================================================================
+# SECTION 4 — Auto-discovery  (Suite F)
+# ================================================================
+
+def _classify_discovered(fpath: Path) -> str:
     """
-    Scan test_dir for files not already covered by TEST_CASES A–E.
+    Assign a sub-label for display inside Suite F.
 
-    Each discovered file becomes a Suite F test case with:
-      • exp_status = any (success / partial / low_confidence_partial / failed)
-      • exp_min    = 0  (we have no prior knowledge of what it contains)
-      • allow_ocr  = same as --ocr flag (images need OCR to produce records)
-
-    Files that do not match a scannable extension are silently skipped.
+    image + --ocr  → "image/OCR"
+    image, no OCR  → "image/no-OCR"
+    structured     → extension upper-case, e.g. "CSV", "PDF"
     """
-    _ANY_STATUS = {"success", "partial", "low_confidence_partial", "failed"}
+    ext = fpath.suffix.lower()
+    if ext in _IMAGE_EXTS:
+        return "image/OCR" if RUN_OCR else "image/no-OCR"
+    return ext.lstrip(".").upper()
 
-    # Names already owned by TEST_CASES — skip them in the scan
-    known_files: set[str] = {tc["file"].lower() for tc in TEST_CASES}
 
-    cases: list[dict] = []
+def _build_suite_f(test_dir: Path) -> list[TestCase]:
+    """
+    Scan test_dir/ and return a TestCase for every file not in REGISTRY.
+
+    Auto-classification:
+      image  → allow_ocr = RUN_OCR  (OCR enabled when --ocr flag present)
+      other  → allow_ocr = False
+    All Suite F cases have open_verdict=True (any outcome is acceptable).
+    """
+    known: set[str] = {tc.file.lower() for tc in REGISTRY}
+    cases: list[TestCase] = []
     if not test_dir.exists():
         return cases
 
     for fpath in sorted(test_dir.iterdir()):
         if not fpath.is_file():
             continue
-        if fpath.name.lower() in _SCAN_IGNORE:
+        if fpath.name.lower() in _IGNORE_FILES:
             continue
-        if fpath.suffix.lower() not in _SCANNABLE_EXTENSIONS:
+        if fpath.suffix.lower() not in _SCANNABLE:
             continue
-        if fpath.name.lower() in known_files:
+        if fpath.name.lower() in known:
             continue
 
-        is_image = fpath.suffix.lower() in {
-            ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"
-        }
-        cases.append(dict(
-            label=fpath.name,
+        is_image = fpath.suffix.lower() in _IMAGE_EXTS
+        cat      = _classify_discovered(fpath)
+        cases.append(TestCase(
+            label=f"{fpath.name}  [{cat}]",
             file=fpath.name,
             suite="F",
-            allow_ocr=run_ocr and is_image,
-            exp_status=_ANY_STATUS,
+            exp_status=_ANY,
             exp_type=None,
             exp_min=0,
-            note="auto-discovered — no expected outcome",
+            note="auto-discovered",
+            allow_ocr=is_image and RUN_OCR,
+            open_verdict=True,
         ))
     return cases
 
 
-def run_all(test_dir: Path, run_ocr: bool = False) -> bool:
-    pl_logger = logging.getLogger("pipeline.test")
-    pl_logger.setLevel(logging.WARNING)
+# ================================================================
+# SECTION 5 — Assertion engine
+# ================================================================
 
-    passed_total = 0
-    failed_tests: list[str] = []
-    skipped:      list[str] = []
+def _evaluate(tc: TestCase, result: PipelineResult) -> tuple[bool, list[tuple[str, bool]]]:
+    """
+    Check all expectations for a TestCase against a PipelineResult.
 
-    if not run_ocr:
-        print(f"\n{YELLOW}  Suite C (OCR screenshots) skipped — add --ocr to enable{RESET}")
+    Returns (overall_passed, list_of_(label, ok) tuples).
+    Cases with open_verdict=True always return (True, [...]).
+    """
+    assertions: list[tuple[str, bool]] = []
 
-    # Build Suite F dynamically from whatever is in test_files/
-    suite_f_cases = _build_suite_f(test_dir, run_ocr)
-
-    all_suites: dict[str, list[dict]] = {}
-    for suite_id in ["A", "B", "C", "D", "E"]:
-        cases = [tc for tc in TEST_CASES if tc["suite"] == suite_id]
-        if cases:
-            all_suites[suite_id] = cases
-    if suite_f_cases:
-        all_suites["F"] = suite_f_cases
-
-    for suite_id, suite_cases in all_suites.items():
-        print(f"\n{'═'*62}")
-        print(f"{BOLD}Suite {suite_id}: {_SUITE_LABELS[suite_id]}{RESET}")
-        if suite_id == "F":
-            print(f"{DIM}  {len(suite_cases)} file(s) found in test_files/ not in TEST_CASES{RESET}")
-        print(f"{'═'*62}")
-
-        for tc in suite_cases:
-            label   = tc["label"]
-            fpath   = test_dir / tc["file"]
-            suite   = tc["suite"]
-            use_ocr = tc.get("allow_ocr", False)
-
-            if suite == "C" and not run_ocr:
-                print(f"\n  {YELLOW}SKIP{RESET}  {label}  (add --ocr to run)")
-                skipped.append(label)
-                continue
-
-            if not fpath.exists():
-                print(f"\n  {YELLOW}SKIP{RESET}  {label} — file not found: {tc['file']}")
-                skipped.append(label)
-                continue
-
-            if not QUIET:
-                print(f"\n{'─'*62}")
-                print(f"{BOLD}[{suite}] {label}{RESET}  ({tc['file']})")
-                print(f"{'─'*62}")
-            else:
-                print(f"  [{suite}] {label} ...", end=" ", flush=True)
-
-            result = run_pipeline(str(fpath), logger=pl_logger, allow_ocr=use_ocr)
-            passed = print_result(result, tc)
-
-            if QUIET:
-                print(f"{GREEN}OK{RESET}" if passed else f"{RED}FAIL{RESET}")
-
-            if passed:
-                passed_total += 1
-            else:
-                failed_tests.append(f"[{suite}] {label}")
-
-    # total_run = known cases that ran + all Suite F cases
-    total_run = (
-        sum(
-            1 for tc in TEST_CASES
-            if not (tc["suite"] == "C" and not run_ocr)
-            and (test_dir / tc["file"]).exists()
-        )
-        + len(suite_f_cases)
+    # Status
+    s_ok = tc.status_ok(result.status)
+    exp_s = (
+        tc.exp_status if isinstance(tc.exp_status, str)
+        else "{" + ", ".join(sorted(tc.exp_status)) + "}"
     )
+    assertions.append((f"status == {exp_s}", s_ok))
 
-    print(f"\n{'='*62}")
-    print(f"{BOLD}Results: {passed_total}/{total_run} passed", end="")
-    if skipped:
-        print(f"  ({len(skipped)} skipped)", end="")
-    if suite_f_cases:
-        print(f"  ({len(suite_f_cases)} auto-discovered)", end="")
-    print(f"{RESET}")
-    if failed_tests:
-        for t in failed_tests:
-            print(f"  {RED}✗ {t}{RESET}")
-    else:
-        print(f"  {GREEN}All run tests passed!{RESET}")
-    if skipped:
-        print(f"  {YELLOW}Skipped: {', '.join(skipped)}{RESET}")
-    print(f"{'='*62}\n")
-    return len(failed_tests) == 0
+    # Input type (skip if exp_type is None)
+    if tc.exp_type is not None:
+        t_ok = result.input_type == tc.exp_type
+        assertions.append((f"input_type == {tc.exp_type!r}", t_ok))
 
+    # Minimum record count (skip if exp_min == 0)
+    if tc.exp_min > 0:
+        c_ok = result.record_count >= tc.exp_min
+        assertions.append((f"record_count >= {tc.exp_min}", c_ok))
 
-def run_single(file_path: str, allow_ocr: bool = False):
-    print(f"\n{BOLD}{CYAN}{'─'*62}{RESET}")
-    print(f"{BOLD}File: {file_path}{RESET}")
-    if allow_ocr:
-        print(f"{YELLOW}  OCR mode: allow_ocr=True{RESET}")
-    print(f"{CYAN}{'─'*62}{RESET}")
-
-    pl_logger = logging.getLogger("pipeline.test")
-    pl_logger.setLevel(logging.WARNING)
-
-    result = run_pipeline(file_path, logger=pl_logger, allow_ocr=allow_ocr)
-    # Treat as Suite X: accept any status, show everything
-    tc = dict(suite="X", exp_type=None, exp_min=0, note="ad-hoc",
-              exp_status={"success", "partial", "low_confidence_partial", "failed"})
-    print_result(result, tc)
+    overall = all(ok for _, ok in assertions)
+    if tc.open_verdict:
+        overall = True   # Suite C / F — never mark as failed
+    return overall, assertions
 
 
 # ================================================================
-# SECTION 6 — Entry point
+# SECTION 6 — Case detail printer
+# ================================================================
+
+# Core fields to show per DTO type (omit boilerplate zeros)
+_DTO_FIELDS: dict[str, list[str]] = {
+    "broker_holding":      ["symbol", "shares", "avg_cost_per_share", "total_cost", "side"],
+    "transaction":         ["symbol", "transaction_move", "shares",
+                            "price_per_share", "total_amount", "executed_at"],
+    "constituent_holding": ["symbol", "weight", "price", "change"],
+}
+
+def _fmt_record(rec) -> dict:
+    d    = rec.model_dump()
+    keys = _DTO_FIELDS.get(d.get("dto_type", ""), list(d.keys()))
+    return {k: d[k] for k in keys if k in d and d[k] not in (None, "", 0.0, 0)}
+
+
+def _print_case_detail(tr: TestResult) -> None:
+    """Print assertion results + records + warnings for one test."""
+    if QUIET or tr.skipped:
+        return
+
+    result = tr.result
+
+    # ── Assertions ────────────────────────────────────────────────
+    for label, ok in tr.assertions:
+        if ok:
+            _ok(label)
+        else:
+            _fail(label)
+
+    # Hard-rejection suites: show rejection reason then stop
+    if tr.suite in ("D", "E"):
+        if result and result.errors:
+            _dim(f"rejection: {result.errors[0].message[:110]}")
+        return
+
+    # ── Latency + record count ────────────────────────────────────
+    _info(f"latency       = {result.total_latency_ms:.0f} ms")
+    _info(f"record_count  = {result.record_count}")
+    if result.input_type:
+        _info(f"input_type    = {result.input_type}")
+
+    # ── Sample records ────────────────────────────────────────────
+    if result.data:
+        prefix = "OCR extracted" if tr.is_ocr else "sample records"
+        _info(f"{prefix}:")
+        n_show = 3 if tr.is_ocr else 2
+        for rec in result.data[:n_show]:
+            print(f"      {_fmt_record(rec)}")
+    else:
+        _info("sample records: none")
+
+    # ── Warnings ─────────────────────────────────────────────────
+    # Filter out routing noise (e.g. "input_type=holding (from classifier)")
+    actionable = [
+        w for w in result.warnings
+        if not (w.startswith("input_type=") and len(w) < 70)
+    ]
+    if actionable:
+        if VERBOSE:
+            for w in actionable:
+                _warn(w)
+        else:
+            # Pick the single most informative warning to surface
+            priority = next(
+                (w for w in actionable
+                 if w.startswith("[MissingRequiredColumns]")
+                    or ("skipped" in w.lower() and "row" in w.lower())),
+                None,
+            )
+            if priority is None and any("[sanity]" in w for w in actionable):
+                n = sum(1 for w in actionable if "[sanity]" in w)
+                priority = (
+                    f"OCR: {n} row(s) have numeric fields that may be misaligned"
+                    " — verify manually."
+                )
+            if priority is None:
+                priority = actionable[0]
+            _warn(f"{len(actionable)} warning(s): {priority[:100]}")
+            if len(actionable) > 1:
+                _dim("  run --verbose to see all warnings")
+
+    # ── Table summaries (verbose only) ────────────────────────────
+    if VERBOSE and result.table_summaries:
+        _info("table summaries:")
+        for s in result.table_summaries:
+            flag  = "SKIP" if s.skipped else "OK  "
+            extra = []
+            if s.parse_confidence != "high":
+                extra.append(f"conf={s.parse_confidence}")
+            if s.suspicious_rows:
+                extra.append(f"suspicious={s.suspicious_rows}")
+            meta = ("  [" + "  ".join(extra) + "]") if extra else ""
+            print(f"      [{flag}] table {s.table_index}: "
+                  f"{s.input_type}, {s.row_count} rows → "
+                  f"{s.record_count} records{meta}")
+
+    # ── Errors ────────────────────────────────────────────────────
+    if result.errors:
+        if tr.suite == "C" or tr.tc.open_verdict:
+            _info(f"pipeline note: {result.errors[0].message[:110]}")
+        else:
+            for e in result.errors:
+                _fail(f"[{e.stage}] {e.error_type}: {e.message[:100]}")
+
+
+# ================================================================
+# SECTION 7 — Summary report
+# ================================================================
+
+def _print_summary(
+    all_results:  list[TestResult],
+    suite_stats:  dict[str, SuiteStats],
+    run_ocr:      bool,
+) -> None:
+    run     = [r for r in all_results if not r.skipped]
+    passed  = [r for r in run if r.passed]
+    failed  = [r for r in run if not r.passed]
+    skipped = [r for r in all_results if r.skipped]
+
+    ocr_run = [r for r in run if r.is_ocr]
+
+    W66 = "═" * 66
+
+    # ── Header ────────────────────────────────────────────────────
+    print(f"\n{W66}")
+    print(f"{B}  SUMMARY REPORT{W}")
+    print(W66)
+
+    # Overall
+    colour = G if not failed else R
+    print(f"\n  {B}Overall{W}  "
+          f"{colour}{len(passed)}/{len(run)} passed{W}"
+          + (f"   {R}{len(failed)} FAILED{W}" if failed else "")
+          + (f"   {Y}{len(skipped)} skipped{W}" if skipped else ""))
+
+    # ── Per-suite table ───────────────────────────────────────────
+    print(f"\n  {'STE':<4}  {'Description':<42}  {'Result':>14}  {'Avg ms':>7}")
+    print(f"  {'─'*4}  {'─'*42}  {'─'*14}  {'─'*7}")
+
+    for sid in ["A", "B", "C", "D", "E", "F"]:
+        st = suite_stats.get(sid)
+        if st is None or st.total == 0:
+            continue
+
+        if sid == "C" and not run_ocr:
+            res_str = f"{Y}skipped (--ocr){W}"
+            lat_str = "     —"
+        else:
+            if st.failed == 0:
+                res_str = f"{G}{st.passed}/{st.run}{W}"
+            else:
+                res_str = f"{R}{st.passed}/{st.run}  ✗{st.failed}{W}"
+            lat_str = f"{st.avg_ms:>6.0f}" if st.avg_ms else "     —"
+
+        label = _SUITE_LABELS[sid][:42]
+        # Pad result string accounting for invisible ANSI codes
+        print(f"  {sid:<4}  {label:<42}  {res_str:<22}  {lat_str}")
+
+    # ── OCR breakdown ─────────────────────────────────────────────
+    if ocr_run:
+        print(f"\n  {'─'*66}")
+        print(f"  {B}OCR Breakdown{W}"
+              + (f"  {D}(--ocr flag was active){W}" if run_ocr else ""))
+        print(f"  {'─'*66}")
+
+        with_data    = [r for r in ocr_run if r.record_count > 0]
+        success_rate = len(with_data) / len(ocr_run) * 100 if ocr_run else 0
+        avg_rec      = (sum(r.record_count for r in with_data) / len(with_data)
+                        if with_data else 0)
+        avg_lat      = (sum(r.latency_ms for r in ocr_run) / len(ocr_run)
+                        if ocr_run else 0)
+
+        print(f"\n  Images attempted      {len(ocr_run)}")
+        print(f"  Produced ≥1 record    {len(with_data)}/{len(ocr_run)}"
+              f"   ({success_rate:.0f}% success rate)")
+        if with_data:
+            print(f"  Avg records / image   {avg_rec:.1f}  (when successful)")
+        print(f"  Avg pipeline latency  {avg_lat:.0f} ms")
+
+        # Per-image table
+        col = f"  {'File':<28}  {'Status':<26}  {'Recs':>4}  {'ms':>6}  {'⚠ sanity':>8}"
+        print(f"\n{col}")
+        print(f"  {'─'*28}  {'─'*26}  {'─'*4}  {'─'*6}  {'─'*8}")
+        for r in ocr_run:
+            if not r.result:
+                continue
+            s = r.result.status
+            sc = (G if s == "success"
+                  else Y if s in ("partial", "low_confidence_partial")
+                  else R)
+            lat_s  = f"{r.latency_ms/1000:.1f}s"
+            sanity = f"{r.sanity_count:>8}" if r.sanity_count else "       —"
+            fname  = r.tc.file[:28]
+            print(f"  {fname:<28}  {sc}{s:<16}{W}  "
+                  f"{r.record_count:>4}  {lat_s:>6}  {sanity}")
+
+    # ── Failed cases detail ───────────────────────────────────────
+    if failed:
+        print(f"\n  {R}{'─'*66}{W}")
+        print(f"  {B}{R}Failed cases{W}")
+        for r in failed:
+            print(f"  {R}✗{W}  [{r.suite}] {r.label}")
+            if r.result and r.result.errors:
+                for e in r.result.errors[:2]:
+                    print(f"       {D}{e.stage}: {e.message[:80]}{W}")
+            for assertion_label, ok in r.assertions:
+                if not ok:
+                    print(f"       {D}✗ {assertion_label}{W}")
+
+    # ── Footer ────────────────────────────────────────────────────
+    verdict = f"{G}ALL PASSED{W}" if not failed else f"{R}FAILURES DETECTED{W}"
+    print(f"\n  {verdict}")
+    print(f"{W66}\n")
+
+
+# ================================================================
+# SECTION 8 — Test runner
+# ================================================================
+
+def run_all(test_dir: Path, run_ocr: bool = False) -> bool:
+    logger = logging.getLogger("pipeline.test")
+    logger.setLevel(logging.WARNING)
+
+    if not run_ocr:
+        print(f"\n{Y}  Suite C (OCR screenshots) skipped — pass --ocr to enable{W}")
+
+    # Build complete case list: registry + auto-discovered Suite F
+    all_cases: list[TestCase] = list(REGISTRY) + _build_suite_f(test_dir)
+
+    # Initialise per-suite stats
+    suite_stats: dict[str, SuiteStats] = {
+        sid: SuiteStats(sid, _SUITE_LABELS.get(sid, sid))
+        for sid in ["A", "B", "C", "D", "E", "F"]
+    }
+
+    all_results: list[TestResult] = []
+
+    # Group cases by suite for block printing
+    from collections import defaultdict
+    grouped: dict[str, list[TestCase]] = defaultdict(list)
+    for tc in all_cases:
+        grouped[tc.suite].append(tc)
+
+    for suite_id in ["A", "B", "C", "D", "E", "F"]:
+        cases = grouped.get(suite_id, [])
+        if not cases:
+            continue
+
+        st = suite_stats[suite_id]
+        st.total = len(cases)
+
+        # Suite header
+        if not QUIET:
+            print(f"\n{'═'*62}")
+            print(f"{B}Suite {suite_id}: {_SUITE_LABELS[suite_id]}{W}")
+            if suite_id == "F":
+                print(f"{D}  {len(cases)} file(s) auto-discovered in test_files/{W}")
+            print(f"{'═'*62}")
+
+        for tc in cases:
+            fpath = test_dir / tc.file
+
+            # ── Determine if we should skip ───────────────────────
+            skip_reason = ""
+            if tc.suite == "C" and not run_ocr:
+                skip_reason = "add --ocr to run"
+            elif not fpath.exists():
+                skip_reason = f"file not found: {tc.file}"
+
+            if skip_reason:
+                st.skipped += 1
+                tr = TestResult(tc=tc, result=None, passed=True,
+                                skipped=True, skip_reason=skip_reason)
+                all_results.append(tr)
+                if not QUIET:
+                    print(f"\n  {Y}SKIP{W}  {tc.label}  ({skip_reason})")
+                continue
+
+            st.run += 1
+
+            # ── Case header ───────────────────────────────────────
+            if not QUIET:
+                print(f"\n{'─'*62}")
+                print(f"{B}[{suite_id}] {tc.label}{W}  ({tc.file})")
+                if tc.note and VERBOSE:
+                    print(f"{D}  {tc.note}{W}")
+                print(f"{'─'*62}")
+            else:
+                label_trunc = tc.label[:44]
+                print(f"  [{suite_id}] {label_trunc:<44}", end=" ", flush=True)
+
+            # ── Execute pipeline ──────────────────────────────────
+            t0 = time.monotonic()
+            result = run_pipeline(str(fpath), logger=logger, allow_ocr=tc.allow_ocr)
+            wall_ms = (time.monotonic() - t0) * 1000
+
+            # ── Evaluate expectations ─────────────────────────────
+            passed, assertions = _evaluate(tc, result)
+
+            tr = TestResult(
+                tc=tc, result=result, passed=passed,
+                wall_ms=wall_ms, assertions=assertions,
+            )
+            all_results.append(tr)
+
+            # ── Update stats ──────────────────────────────────────
+            if passed:
+                st.passed += 1
+            else:
+                st.failed += 1
+            st.latencies.append(result.total_latency_ms)
+
+            # ── Print detail / quiet line ─────────────────────────
+            if not QUIET:
+                _print_case_detail(tr)
+            else:
+                status_tag = f"{G}OK  {W}" if passed else f"{R}FAIL{W}"
+                print(f"{status_tag}  "
+                      f"{result.record_count:>4} recs  "
+                      f"{result.total_latency_ms:>6.0f} ms  "
+                      f"[{result.status}]")
+
+    _print_summary(all_results, suite_stats, run_ocr)
+
+    return all(r.passed for r in all_results if not r.skipped)
+
+
+# ================================================================
+# SECTION 9 — Single-file ad-hoc mode
+# ================================================================
+
+def run_single(file_path: str, allow_ocr: bool = False) -> None:
+    print(f"\n{B}{C}{'─'*62}{W}")
+    print(f"{B}File: {file_path}{W}")
+    if allow_ocr:
+        print(f"{Y}  OCR mode: allow_ocr=True{W}")
+    print(f"{C}{'─'*62}{W}")
+
+    logger = logging.getLogger("pipeline.test")
+    logger.setLevel(logging.WARNING)
+
+    result = run_pipeline(file_path, logger=logger, allow_ocr=allow_ocr)
+    tc = TestCase(
+        label="ad-hoc", file=Path(file_path).name,
+        suite="X", exp_status=_ANY,
+        exp_type=None, exp_min=0, note="single file",
+        allow_ocr=allow_ocr, open_verdict=True,
+    )
+    _, assertions = _evaluate(tc, result)
+    tr = TestResult(tc=tc, result=result, passed=True, assertions=assertions)
+    _print_case_detail(tr)
+
+
+# ================================================================
+# SECTION 10 — Entry point
 # ================================================================
 
 if __name__ == "__main__":
     test_dir = _here / "test_files"
-    run_ocr  = "--ocr" in sys.argv
-    args     = [a for a in sys.argv[1:]
-                if not a.startswith("--")]
+    args     = [a for a in sys.argv[1:] if not a.startswith("--")]
 
-    print(f"\n{BOLD}Preparing test files (if missing)...{RESET}")
+    print(f"\n{B}Preparing test files (if missing)...{W}")
     generate_synthetic_fixtures(test_dir)
 
     if args:
-        run_single(args[0], allow_ocr=run_ocr)
+        run_single(args[0], allow_ocr=RUN_OCR)
     else:
-        success = run_all(test_dir, run_ocr=run_ocr)
+        success = run_all(test_dir, run_ocr=RUN_OCR)
         sys.exit(0 if success else 1)
