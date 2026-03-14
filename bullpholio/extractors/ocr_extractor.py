@@ -186,26 +186,69 @@ _READER_CACHE: object = None  # PaddleOCR instance, lazily initialised
 def _get_reader():
     """
     Return the cached PaddleOCR instance, initialising it on first call.
-    Targets PaddleOCR 2.x (tested on 2.8.1 + paddlepaddle 2.6.2).
+
+    Version compatibility
+    ─────────────────────
+    PaddleOCR 2.x (≤2.8)  — accepts use_gpu=False, use_angle_cls=True, show_log
+    PaddleOCR 3.x (PaddlePDX-based)
+      • use_gpu and use_angle_cls are removed.
+      • 3.x accepts **kwargs in __init__ WITHOUT raising — the "Unknown argument"
+        error fires lazily inside the C++ prediction engine when .ocr() is called.
+        This means a try/except around __init__ does NOT protect against it.
+      • Must detect version BEFORE building kwargs, using paddleocr.__version__.
+      • 3.x also prints a connectivity banner; suppress via env var before init.
+
+    _PADDLE_MAJOR is set here and read by _run_paddleocr to select the correct
+    result-format parser (2.x vs 3.x changed the wire format of .ocr() output).
     """
-    global _READER_CACHE
-    if _READER_CACHE is None:
-        import logging
-        try:
-            from paddleocr import PaddleOCR  # type: ignore[import-untyped]
-        except ImportError:
-            raise ImportError("Missing dependency. Run: pip install paddleocr==2.8.1 paddlepaddle==2.6.2")
+    global _READER_CACHE, _PADDLE_MAJOR
+    if _READER_CACHE is not None:
+        return _READER_CACHE
 
-        # Mute verbose ppocr INFO output.
-        for noisy in ("ppocr", "paddle", "paddleocr", "ppstructure"):
-            logging.getLogger(noisy).setLevel(logging.WARNING)
+    import logging
+    import os
 
-        _READER_CACHE = PaddleOCR(
-            use_angle_cls=True,
-            lang="en",
-            use_gpu=False,
-            show_log=False,
+    try:
+        import paddleocr as _paddleocr_mod  # type: ignore[import-untyped]
+        from paddleocr import PaddleOCR     # type: ignore[import-untyped]
+    except ImportError:
+        raise ImportError(
+            "Missing dependency. "
+            "For PaddleOCR 2.x: pip install paddleocr==2.8.1 paddlepaddle==2.6.2\n"
+            "For PaddleOCR 3.x: pip install paddleocr>=3.0 paddlepaddle>=3.0"
         )
+
+    # Detect major version from __version__ string BEFORE building kwargs.
+    # This avoids passing 2.x-only params (use_gpu, use_angle_cls) to 3.x
+    # where they are silently accepted at __init__ but blow up at .ocr() time.
+    try:
+        _ver_str = getattr(_paddleocr_mod, "__version__", "2.0.0")
+        _PADDLE_MAJOR = int(str(_ver_str).split(".")[0])
+    except Exception:
+        _PADDLE_MAJOR = 2   # conservative fallback
+
+    # Mute verbose ppocr / paddlex INFO output
+    for _noisy in ("ppocr", "paddle", "paddleocr", "ppstructure", "paddlex"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+    # 3.x prints a connectivity banner before model init; suppress it
+    if _PADDLE_MAJOR >= 3:
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+
+    # Build kwargs for the detected major version
+    if _PADDLE_MAJOR >= 3:
+        # use_angle_cls and use_gpu are gone in 3.x
+        _kwargs: dict = {"lang": "en", "show_log": False, "device": "cpu"}
+    else:
+        # 2.x: use_angle_cls + use_gpu are both valid
+        _kwargs = {
+            "use_angle_cls": True,
+            "lang":          "en",
+            "show_log":      False,
+            "use_gpu":       False,
+        }
+
+    _READER_CACHE = PaddleOCR(**_kwargs)
     return _READER_CACHE
 
 
@@ -224,25 +267,71 @@ def warmup_ocr() -> None:
 
 def _run_paddleocr(reader, path: str, conf_min: float = 0.05) -> list[tuple]:
     """
-    Run PaddleOCR (2.x) on a single image and return
-    (bbox, text, confidence) tuples with conf >= conf_min.
+    Run PaddleOCR on a single image and return (bbox, text, confidence) tuples
+    with conf >= conf_min.
 
-    PaddleOCR 2.x layout:
-        raw[0]  — list of [bbox, (text, score)] for the page
-        bbox    — [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+    Result format changed between major versions:
+
+    PaddleOCR 2.x  →  raw[0] is a list of [bbox, (text, score)]
+                       where bbox = [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+
+    PaddleOCR 3.x  →  raw[0] is a list of dicts:
+                       {"transcription": {"text": "...", "score": 0.9},
+                        "points": [[x1,y1], ...]}
+                       OR attribute-based objects with .rec_texts / .rec_scores
+                       / .dt_polys (some 3.x builds).
+
+    cls= kwarg removed in 3.x — pass it only for 2.x to avoid TypeError.
     """
     try:
-        raw = reader.ocr(path, cls=True)
+        if _PADDLE_MAJOR >= 3:
+            raw = reader.ocr(path)
+        else:
+            try:
+                raw = reader.ocr(path, cls=True)
+            except TypeError:
+                raw = reader.ocr(path)
 
         if not raw or raw[0] is None:
             return []
 
-        results = []
+        results: list[tuple] = []
         for line in raw[0]:
-            bbox, (text, conf) = line
-            text = text.strip()
-            if conf >= conf_min and text:
-                results.append((bbox, text, conf))
+            try:
+                # ── Format A: 2.x list  [bbox, (text, conf)] ─────────────────
+                if isinstance(line, (list, tuple)) and len(line) == 2:
+                    bbox, payload = line[0], line[1]
+                    if isinstance(payload, (list, tuple)) and len(payload) == 2:
+                        text = str(payload[0]).strip()
+                        conf = float(payload[1])
+                        if conf >= conf_min and text:
+                            results.append((bbox, text, conf))
+                        continue
+
+                # ── Format B: 3.x dict ────────────────────────────────────────
+                if isinstance(line, dict):
+                    tc   = line.get("transcription") or {}
+                    text = str(tc.get("text", "") or "").strip()
+                    conf = float(tc.get("score", 0) or 0)
+                    bbox = line.get("points") or line.get("bbox") or []
+                    if conf >= conf_min and text:
+                        results.append((bbox, text, conf))
+                    continue
+
+                # ── Format C: 3.x attribute object ───────────────────────────
+                if hasattr(line, "rec_texts"):
+                    for text, conf, poly in zip(
+                        line.rec_texts  or [],
+                        line.rec_scores or [],
+                        line.dt_polys   or [],
+                    ):
+                        text = str(text).strip()
+                        if float(conf) >= conf_min and text:
+                            results.append((poly, text, float(conf)))
+                    continue
+
+            except Exception:
+                continue   # malformed line — skip silently
 
         return results
 
