@@ -13,27 +13,39 @@ Change log
          (e.g. GTLOX showing avg_cost=1033 when actual total_cost=1033).
 2024-04  Added REBALANCE_COLUMN_ALIASES for rebalance plan documents.
          Broadened shares/transaction_move aliases to catch OCR variants.
+2025-03  Added aliases for Indian broker screenshots (scrip, buy price,
+         buy value, gain/loss (%), etc.) and Excel transaction logs
+         (exchange code: ticker, txn date).
 """
 
 HOLDING_COLUMN_ALIASES: dict[str, list[str]] = {
     "symbol":             ["symbol", "ticker", "stock", "security", "stock symbol",
                            "ticker symbol", "instrument", "security id",
-                           "股票代码", "代码", "证券代码"],
+                           "股票代码", "代码", "证券代码",
+                           # Indian broker (BSE / NSE) uses "Scrip"
+                           "scrip",
+                           # Excel transaction logs: "EXCHANGE CODE: TICKER"
+                           "exchange code: ticker", "exchange code"],
     "name":               ["name", "company", "security name", "stock name",
                            "description", "company name", "公司名称", "名称", "证券名称"],
     "shares":             ["shares", "quantity", "qty", "units", "position",
                            "shares held", "number of shares", "# shares",
                            "no. of shares", "holding", "pos", "position size",
-                           "股数", "数量", "持股数"],
+                           "股数", "数量", "持股数",
+                           "holding qty"],
     "avg_cost_per_share": ["avg cost", "average cost", "avg price", "average price",
                            "avg cost per share", "average cost per share",
-                           "unit cost", "均价", "平均成本", "成本价"],
+                           "unit cost", "均价", "平均成本", "成本价",
+                           # Indian broker: "Buy Price" column
+                           "buy price", "purchase price"],
     "total_cost":         ["total cost", "cost", "book value", "total value",
                            "book cost", "total book value",
                            # "Cost Basis" in broker UIs = total amount paid, not per-share.
                            # Fidelity, Schwab, IBKR all use this convention.
                            "cost basis", "total cost basis",
-                           "总成本", "账面价值", "成本基础"],
+                           "总成本", "账面价值", "成本基础",
+                           # Indian broker: "Buy Value" column
+                           "buy value", "purchase value"],
     "side":               ["side", "position type", "long/short", "direction",
                            "position side", "多空", "方向"],
     "first_trading_date": ["first trading date", "open date", "first purchase",
@@ -48,16 +60,24 @@ HOLDING_COLUMN_ALIASES: dict[str, list[str]] = {
     "day_gain":     ["day's gain", "day gain", "daily gain", "today's gain",
                      "change today", "日收益"],
     "overall_gain": ["overall gain", "total gain", "total return", "gain/loss",
-                     "unrealized gain", "总收益", "浮动盈亏"],
+                     "unrealized gain", "总收益", "浮动盈亏",
+                     # OCR may drop the slash from "gain/loss"
+                     "gain loss"],
     # Performance display-only fields — in performance reports / position summaries
     "overall_gain_pct": ["overall gain %", "gain %", "return %", "total return %",
                          "% gain", "% return", "% change", "pct return",
-                         "overall gain percent", "unrealized gain %", "收益率"],
+                         "overall gain percent", "unrealized gain %", "收益率",
+                         # Indian broker: "GAIN/LOSS (%)" header and OCR variants
+                         "gain/loss (%)", "gain loss %", "gain/loss(%)", "(%)"],
 }
 
 TRANSACTION_COLUMN_ALIASES: dict[str, list[str]] = {
     "symbol":           ["symbol", "ticker", "stock", "security", "instrument",
-                         "stock symbol", "security id", "股票代码", "代码"],
+                         "stock symbol", "security id", "股票代码", "代码",
+                         # Indian broker (BSE / NSE)
+                         "scrip",
+                         # Excel transaction logs
+                         "exchange code: ticker", "exchange code"],
     "transaction_move": [
         # Standard column headers
         "type", "action", "transaction type", "move", "buy/sell",
@@ -84,7 +104,9 @@ TRANSACTION_COLUMN_ALIASES: dict[str, list[str]] = {
                          "net debit", "net credit", "净额"],
     "executed_at":      ["date", "execution date", "trade date", "executed at",
                          "transaction date", "trade time", "settled date",
-                         "交易日期", "成交日期"],
+                         "交易日期", "成交日期",
+                         # Excel transaction logs: "TXN DATE"
+                         "txn date", "txn_date", "trans date"],
     "settled_at":       ["settlement date", "settle date", "settled at",
                          "value date", "清算日期"],
     "notes":            ["notes", "memo", "remarks", "comment",
@@ -111,7 +133,8 @@ TRANSACTION_REQUIRED: set[str] = {"symbol", "transaction_move", "shares", "execu
 # ConstituentHoldingDTO only needs symbol + weight OR price
 CONSTITUENT_COLUMN_ALIASES: dict[str, list[str]] = {
     "symbol":       ["symbol", "ticker", "stock", "security", "instrument",
-                     "stock symbol", "security id", "股票代码", "代码"],
+                     "stock symbol", "security id", "股票代码", "代码",
+                     "scrip", "exchange code: ticker", "exchange code"],
     "name":         ["name", "company", "security name", "stock name",
                      "description", "公司名称", "名称"],
     "weight":       ["weight", "% weight", "wt", "allocation", "% alloc",
@@ -139,7 +162,8 @@ CONSTITUENT_REQUIRED: set[str] = {"symbol"}  # weight OR price checked at row le
 
 REBALANCE_COLUMN_ALIASES: dict[str, list[str]] = {
     "symbol":         ["symbol", "ticker", "stock", "security", "instrument",
-                       "stock symbol", "security id", "股票代码", "代码"],
+                       "stock symbol", "security id", "股票代码", "代码",
+                       "scrip", "exchange code: ticker", "exchange code"],
     "name":           ["name", "description", "security name", "company",
                        "公司名称", "名称"],
     "current_weight": ["current weight", "current %", "current allocation",

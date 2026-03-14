@@ -91,13 +91,22 @@ def _estimate_text_density(image_path: str) -> float:
     return float(binary.sum() // 255) / binary.size
 
 
-def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
+def _has_table_structure(image_path: str, min_lines: int = 4,
+                         text_density: float | None = None) -> bool:
     """
     Use OpenCV to decide whether an image contains a table.
 
     Stage 1 — grid lines: morphological line detection + connectedComponents.
     Stage 2 — borderless text-alignment fallback: contour-based column/row
                bucket detection (pure OpenCV, no OCR required).
+              Parameters relaxed vs original to handle modern web UI screenshots
+              (Morningstar, Koyfin, StockRover, etc.) which have:
+                - no visible grid lines (borderless / zebra-stripe rows)
+                - navigation bars, tabs, and sidebar elements
+    Stage 3 — high-density text grid fallback: if text_density > 0.03, the
+              image is almost certainly a document/UI screenshot (not a photo).
+              Apply much more lenient contour analysis with no aspect-ratio
+              filter and coarser spatial buckets.
     """
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -118,7 +127,7 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
     if h_count >= min_lines and v_count >= min_lines:
         return True
 
-    # Stage 2: borderless text-alignment heuristic
+    # ── Shared contour extraction for Stage 2 + 3 ────────────────
     cell_kernel = cv2.getStructuringElement(
         cv2.MORPH_RECT,
         (max(img_w // 40, 8), max(img_h // 80, 4)),
@@ -132,6 +141,17 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
     max_blob_w = img_w * 0.90
 
     total_contours = len(contours)
+
+    # Stage 2: borderless text-alignment heuristic (RELAXED)
+    # Changes vs original thresholds:
+    #   - aspect ratio filter:  (bw / bh) < 2.0  ->  < 1.0
+    #     Web UI cells can be nearly square (short ticker + padding).
+    #   - contour ratio gate:   < 0.15  ->  < 0.08
+    #     Web UIs have many non-table contours (buttons, nav, icons).
+    #   - min blobs:  6  ->  4
+    #     Smaller visible table area in full-page screenshots.
+    #   - col spread gate:  > 0.55  ->  > 0.70
+    #     Dense financial tables legitimately fill most horizontal space.
     cx_list: list[int] = []
     cy_list: list[int] = []
     for cnt in contours:
@@ -143,36 +163,62 @@ def _has_table_structure(image_path: str, min_lines: int = 4) -> bool:
             continue
         if bh > max_blob_h or bw > max_blob_w:
             continue
-        if (bw / bh) < 2.0:
+        if (bw / bh) < 1.0:           # relaxed: allow square-ish web UI cells
             continue
         cx_list.append(x + bw // 2)
         cy_list.append(y + bh // 2)
 
-    if total_contours > 0 and (len(cx_list) / total_contours) < 0.15:
-        return False
-    if len(cx_list) < 6:
-        return False
+    if total_contours > 0 and (len(cx_list) / total_contours) < 0.08:  # relaxed for web UIs
+        pass  # do not return False yet — Stage 3 may rescue
+    elif len(cx_list) < 4:  # relaxed: smaller visible table area in full-page screenshots
+        pass  # do not return False yet — Stage 3 may rescue
+    else:
+        x_bucket = max(1, img_w // 33)
+        y_bucket = max(1, img_h // 50)
+        col_buckets = len(set(cx // x_bucket for cx in cx_list))
+        row_buckets = len(set(cy // y_bucket for cy in cy_list))
 
-    x_bucket = max(1, img_w // 33)
-    y_bucket = max(1, img_h // 50)
-    col_buckets = len(set(cx // x_bucket for cx in cx_list))
-    row_buckets = len(set(cy // y_bucket for cy in cy_list))
+        if col_buckets >= 2 and row_buckets >= 2 and col_buckets * row_buckets >= 4:
+            total_x_buckets = max(1, img_w // x_bucket)
+            if not (col_buckets > 8 and (col_buckets / total_x_buckets) > 0.70):  # relaxed for dense tables
+                col_bucket_counts: dict[int, int] = {}
+                for cx in cx_list:
+                    b = cx // x_bucket
+                    col_bucket_counts[b] = col_bucket_counts.get(b, 0) + 1
+                if sum(1 for c in col_bucket_counts.values() if c >= 2) >= 2:
+                    return True
 
-    if not (col_buckets >= 2 and row_buckets >= 2 and col_buckets * row_buckets >= 4):
-        return False
+    # ── Stage 3: high-density text grid fallback ─────────────────
+    # If text density > 3%, the image is almost certainly a document or
+    # UI screenshot, NOT a photo.  Apply lenient contour analysis that
+    # skips the aspect-ratio filter entirely and uses coarser buckets.
+    # This rescues web UI screenshots (Morningstar, Koyfin, StockRover)
+    # that fail Stage 2 due to nav bars, tabs, and dark themes.
+    if text_density is not None and text_density > 0.03:
+        cx3: list[int] = []
+        cy3: list[int] = []
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            area = bw * bh
+            if not (min_area < area < max_area):
+                continue
+            if bw < 4 or bh < 3:
+                continue
+            if bh > max_blob_h or bw > max_blob_w:
+                continue
+            # No aspect ratio filter — allow any blob shape
+            cx3.append(x + bw // 2)
+            cy3.append(y + bh // 2)
 
-    total_x_buckets = max(1, img_w // x_bucket)
-    if col_buckets > 8 and (col_buckets / total_x_buckets) > 0.55:
-        return False
+        if len(cx3) >= 6:
+            x_bucket3 = max(1, img_w // 25)   # coarser buckets than Stage 2
+            y_bucket3 = max(1, img_h // 40)
+            col3 = len(set(cx // x_bucket3 for cx in cx3))
+            row3 = len(set(cy // y_bucket3 for cy in cy3))
+            if col3 >= 2 and row3 >= 3:
+                return True
 
-    col_bucket_counts: dict[int, int] = {}
-    for cx in cx_list:
-        b = cx // x_bucket
-        col_bucket_counts[b] = col_bucket_counts.get(b, 0) + 1
-    if sum(1 for c in col_bucket_counts.values() if c >= 2) < 2:
-        return False
-
-    return True
+    return False
 
 
 # ── Main extractor ────────────────────────────────────────────────────────────
@@ -203,9 +249,9 @@ def _extract_tables_from_image(
     short_side = min(w, h) if (w > 0 and h > 0) else 0
 
     # ── Gate 1a: hard minimum width ──────────────────────────────────────────
-    # Images narrower than 400px cannot be read by EasyOCR even after 4×
+    # Images narrower than 400px cannot be read by EasyOCR even after 4x
     # upscaling — CRAFT text detector produces 0 tokens at that resolution.
-    # This saves ~40s for trans.png (330×180) by skipping all OCR entirely.
+    # This saves ~40s for trans.png (330x180) by skipping all OCR entirely.
     # Also catches animated GIFs / corrupt files where cv2 returns (0, 0).
     if w < _MIN_WIDTH_FOR_OCR:
         if allow_ocr:
@@ -228,7 +274,8 @@ def _extract_tables_from_image(
     # Full morphological table detection.  A non-table image always gets
     # image_no_table(), regardless of allow_ocr — the absence of a table is the
     # real reason, not the OCR setting.
-    if not _has_table_structure(file_path):
+    # Pass pre-computed density so Stage 3 (high-density fallback) can use it.
+    if not _has_table_structure(file_path, text_density=density):
         raise ValueError(image_no_table(file_path))
 
     # ── Gate 2: OCR mode check ────────────────────────────────────────────────
